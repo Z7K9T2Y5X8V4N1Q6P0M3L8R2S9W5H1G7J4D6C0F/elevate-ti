@@ -5,6 +5,8 @@ edition = "2024"
 description = "A safe, idiomatic Rust library to obtain Windows TrustedInstaller privileges"
 repository = "https://github.com/Z7K9T2Y5X8V4N1Q6P0M3L8R2S9W5H1G7J4D6C0F/elevate-ti"
 license = "GPL-3.0-or-later"
+keywords = ["elevation", "privilege", "security", "trustedinstaller", "windows"]
+categories = ["development-tools", "os::windows-apis"]
 
 [dependencies]
 thiserror = "2.0"
