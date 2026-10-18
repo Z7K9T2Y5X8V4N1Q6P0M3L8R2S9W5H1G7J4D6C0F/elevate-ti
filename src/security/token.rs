@@ -24,7 +24,7 @@ use windows::{
     core::PCWSTR,
 };
 
-use super::{Sid, privilege::Privilege, win32};
+use super::{HandleGuard, Sid, privilege::Privilege, win32};
 use crate::error::ElevateError;
 
 /// Target token type when duplicating an existing security token.
@@ -63,17 +63,13 @@ impl Token {
 
     /// Open the security token belonging to an arbitrary running process by PID.
     pub fn from_pid(pid: u32) -> Result<Self, ElevateError> {
-        let proc = win32!(OpenProcess(PROCESS_QUERY_INFORMATION, false, pid))?;
+        let proc = HandleGuard(win32!(OpenProcess(PROCESS_QUERY_INFORMATION, false, pid))?);
         let mut token = HANDLE::default();
-        let res = win32!(OpenProcessToken(
-            proc,
+        win32!(OpenProcessToken(
+            proc.0,
             TOKEN_ACCESS_MASK(MAXIMUM_ALLOWED),
             &raw mut token
-        ));
-        unsafe {
-            let _ = CloseHandle(proc);
-        }
-        res?;
+        ))?;
         Ok(Self(token))
     }
 

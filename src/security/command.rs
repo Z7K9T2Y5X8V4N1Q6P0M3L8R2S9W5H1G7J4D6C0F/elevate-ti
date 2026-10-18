@@ -10,7 +10,6 @@ use std::{
 
 use windows::{
     Win32::{
-        Foundation::CloseHandle,
         System::{
             Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock},
             Threading::{
@@ -23,8 +22,21 @@ use windows::{
     core::{HSTRING, PCWSTR, PWSTR},
 };
 
-use super::{token::Token, win32};
+use super::{HandleGuard, token::Token, win32};
 use crate::error::ElevateError;
+
+/// RAII guard for destroying the Win32 user environment block.
+struct EnvBlockGuard(*mut c_void);
+
+impl Drop for EnvBlockGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                let _ = DestroyEnvironmentBlock(self.0);
+            }
+        }
+    }
+}
 
 /// Builder for launching processes under a specified primary security token.
 #[must_use = "commands do nothing unless spawned"]
@@ -81,12 +93,13 @@ impl<'a> TokenCommand<'a> {
         let mut cmd_utf16: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
 
         // Generate a tailored environment block for this token.
-        let mut env_block: *mut c_void = ptr::null_mut();
+        let mut raw_env_block: *mut c_void = ptr::null_mut();
         win32!(CreateEnvironmentBlock(
-            &raw mut env_block,
+            &raw mut raw_env_block,
             self.token.as_raw(),
             false
         ))?;
+        let _env_guard = EnvBlockGuard(raw_env_block);
 
         let cwd = env::current_dir()?;
         let cwd_hstr = HSTRING::from(cwd.as_os_str());
@@ -106,28 +119,15 @@ impl<'a> TokenCommand<'a> {
             PCWSTR::null(),
             PWSTR(cmd_utf16.as_mut_ptr()),
             CREATE_UNICODE_ENVIRONMENT,
-            Some(env_block),
+            Some(raw_env_block),
             &cwd_hstr,
             &raw const si,
             &raw mut pi,
         ));
 
-        // Ensure resources are strictly cleaned up via RAII.
-        if !env_block.is_null() {
-            unsafe {
-                let _ = DestroyEnvironmentBlock(env_block);
-            }
-        }
-        if !pi.hProcess.is_invalid() {
-            unsafe {
-                let _ = CloseHandle(pi.hProcess);
-            }
-        }
-        if !pi.hThread.is_invalid() {
-            unsafe {
-                let _ = CloseHandle(pi.hThread);
-            }
-        }
+        // Immediately transfer process and thread handles to RAII guards regardless of spawn outcome.
+        let _process_guard = HandleGuard(pi.hProcess);
+        let _thread_guard = HandleGuard(pi.hThread);
 
         spawn_res?;
         Ok(())
