@@ -32,7 +32,10 @@ jobs:
           git status --porcelain
           git diff Cargo.lock
 
+      - name: Dry run
+        run: cargo publish --dry-run
+
       - name: Publish to crates.io
-        run: cargo publish --allow-dirty
+        run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
