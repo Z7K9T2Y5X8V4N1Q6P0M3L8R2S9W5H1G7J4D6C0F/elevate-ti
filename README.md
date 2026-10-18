@@ -4,6 +4,7 @@
 
 **A safe, idiomatic Rust library to obtain Windows TrustedInstaller privileges.**
 
+[![Crates.io](https://img.shields.io/crates/v/elevate-ti?style=flat-square)](https://crates.io/crates/elevate-ti)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPLv3-blue.svg?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?style=flat-square&logo=windows)](https://microsoft.com)
 [![Rust](https://img.shields.io/badge/Language-Rust_2024-dea584?style=flat-square&logo=rust)](https://rust-lang.org)
@@ -30,11 +31,10 @@ Caller (Admin)
 
 ## Quickstart
 
-Add `elevate-ti` to your `Cargo.toml`:
+Add `elevate-ti` to your `Cargo.toml` by running:
 
-```toml
-[dependencies]
-elevate-ti = { git = "https://github.com/Z7K9T2Y5X8V4N1Q6P0M3L8R2S9W5H1G7J4D6C0F/elevate-ti.git", branch = "main" }
+```bash
+cargo add elevate-ti
 ```
 
 ### Automatic Self-Relaunch
