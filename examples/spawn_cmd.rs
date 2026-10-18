@@ -7,7 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Spawning an elevated Command Prompt...");
 
     elevated_command()?
-        .exe("C:\\Windows\\System32\\cmd.exe")
+        .exe("%SystemRoot%\\System32\\cmd.exe")
         .args("cmd.exe /k whoami /groups")
         .spawn()?;
 
