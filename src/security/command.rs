@@ -2,8 +2,9 @@
 
 use std::{
     env,
-    ffi::c_void,
+    ffi::{OsString, c_void},
     mem,
+    os::windows::ffi::OsStringExt,
     path::{Path, PathBuf},
     ptr,
 };
@@ -11,7 +12,9 @@ use std::{
 use windows::{
     Win32::{
         System::{
-            Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock},
+            Environment::{
+                CreateEnvironmentBlock, DestroyEnvironmentBlock, ExpandEnvironmentStringsW,
+            },
             Threading::{
                 CREATE_PROCESS_LOGON_FLAGS, CREATE_UNICODE_ENVIRONMENT, CreateProcessWithTokenW,
                 PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW,
@@ -64,9 +67,10 @@ impl TokenCommand {
         Ok(self)
     }
 
-    /// Set a custom target executable path.
+    /// Set a custom target executable path. Supports environment variable
+    /// references like `%SystemRoot%`, which are expanded immediately.
     pub fn exe(mut self, path: impl AsRef<Path>) -> Self {
-        self.exe = Some(path.as_ref().to_path_buf());
+        self.exe = Some(expand_env_path(path.as_ref()));
         self
     }
 
@@ -84,15 +88,16 @@ impl TokenCommand {
 
     /// Spawn the process under the configured token context.
     pub fn spawn(self) -> Result<(), ElevateError> {
-        let cmd = match (self.args, self.exe) {
-            (Some(args), _) => args,
+        let exe_hstr = self.exe.as_ref().map(|p| HSTRING::from(p.as_os_str()));
+
+        let cmd = match (&self.args, &self.exe) {
+            (Some(args), _) => args.clone(),
             (None, Some(exe)) => format!("\"{}\"", exe.display()),
             (None, None) => return Err(ElevateError::MissingExePath),
         };
 
         let mut cmd_utf16: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
 
-        // Generate a tailored environment block for this token.
         let mut raw_env_block: *mut c_void = ptr::null_mut();
         win32!(CreateEnvironmentBlock(
             &raw mut raw_env_block,
@@ -113,10 +118,15 @@ impl TokenCommand {
         };
         let mut pi = PROCESS_INFORMATION::default();
 
+        let app_name = match &exe_hstr {
+            Some(h) => PCWSTR(h.as_ptr()),
+            None => PCWSTR::null(),
+        };
+
         let spawn_res = win32!(CreateProcessWithTokenW(
             self.token.as_raw(),
             CREATE_PROCESS_LOGON_FLAGS(0),
-            PCWSTR::null(),
+            app_name,
             PWSTR(cmd_utf16.as_mut_ptr()),
             CREATE_UNICODE_ENVIRONMENT,
             Some(raw_env_block),
@@ -132,4 +142,24 @@ impl TokenCommand {
         spawn_res?;
         Ok(())
     }
+}
+
+/// Expand `%VAR%`-style environment variable references in a path.
+/// Falls back to the original path on failure.
+fn expand_env_path(path: &Path) -> PathBuf {
+    let input = HSTRING::from(path.as_os_str());
+
+    let needed = unsafe { ExpandEnvironmentStringsW(&input, None) };
+    if needed == 0 {
+        return path.to_path_buf();
+    }
+
+    let mut buf: Vec<u16> = vec![0; needed as usize];
+    let written = unsafe { ExpandEnvironmentStringsW(&input, Some(&mut buf)) };
+    if written == 0 || written as usize > buf.len() {
+        return path.to_path_buf();
+    }
+
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    PathBuf::from(OsString::from_wide(&buf[..len]))
 }
