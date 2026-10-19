@@ -32,9 +32,9 @@ pub fn status() -> Result<ElevationStatus, ElevateError> {
 }
 
 /// Create a new [`TokenCommand`] configured with an elevated `TrustedInstaller` token.
-pub fn elevated_command() -> Result<TokenCommand<'static>, ElevateError> {
+pub fn elevated_command() -> Result<TokenCommand, ElevateError> {
     let strategy = TrustedInstallerStrategy::default();
-    let token = Box::leak(Box::new(strategy.acquire_primary_token()?));
+    let token = strategy.acquire_primary_token()?;
     Ok(TokenCommand::new(token))
 }
 

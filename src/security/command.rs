@@ -40,16 +40,16 @@ impl Drop for EnvBlockGuard {
 
 /// Builder for launching processes under a specified primary security token.
 #[must_use = "commands do nothing unless spawned"]
-pub struct TokenCommand<'a> {
-    token: &'a Token,
+pub struct TokenCommand {
+    token: Token,
     exe: Option<PathBuf>,
     args: Option<String>,
     desktop: HSTRING,
 }
 
-impl<'a> TokenCommand<'a> {
+impl TokenCommand {
     /// Create a new command builder bound to an elevated primary token.
-    pub fn new(token: &'a Token) -> Self {
+    pub fn new(token: Token) -> Self {
         Self {
             token,
             exe: None,
