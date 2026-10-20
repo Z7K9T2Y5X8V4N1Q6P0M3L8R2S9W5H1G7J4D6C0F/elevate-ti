@@ -32,3 +32,16 @@ jobs:
 
       - name: Documentation check
         run: cargo doc --no-deps
+
+  semver-check:
+    name: Check SemVer Compatibility
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run cargo-semver-checks
+        uses: obi1kenobi/cargo-semver-checks-action@v2

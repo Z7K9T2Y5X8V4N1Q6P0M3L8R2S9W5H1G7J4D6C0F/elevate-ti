@@ -4,6 +4,7 @@ use std::io;
 use thiserror::Error;
 
 /// The central error type for all privilege elevation and Windows security operations.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum ElevateError {
     /// A raw Win32 subsystem call failed.
@@ -44,4 +45,11 @@ pub enum ElevateError {
     /// A query to token information returned corrupted or out-of-bounds data.
     #[error("Token information buffer is invalid or empty")]
     InvalidTokenBuffer,
+
+    /// A service stopped unexpectedly after a start request was dispatched.
+    #[error("Service '{name}' stopped unexpectedly after start was requested")]
+    ServiceFailed {
+        /// Name of the target service.
+        name: String,
+    },
 }

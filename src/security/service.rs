@@ -12,7 +12,8 @@ use windows::{
         System::Services::{
             CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_HANDLE,
             SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS,
-            SERVICE_RUNNING, SERVICE_START, SERVICE_STATUS_PROCESS, StartServiceW,
+            SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS_PROCESS,
+            SERVICE_STOPPED, StartServiceW,
         },
     },
     core::PCWSTR,
@@ -20,6 +21,10 @@ use windows::{
 
 use super::win32;
 use crate::error::ElevateError;
+
+/// Number of status queries tolerated where the state remains `SERVICE_STOPPED`
+/// immediately after `try_start()` returns successfully.
+const STOPPED_GRACE_TICKS: u32 = 3;
 
 /// Aligned stack storage matching the byte layout and alignment of `SERVICE_STATUS_PROCESS`.
 #[repr(C, align(8))]
@@ -76,13 +81,16 @@ impl Drop for Service {
 impl Service {
     /// Ensure the service is running and wait until it enters `SERVICE_RUNNING`, returning its PID.
     pub fn start_and_wait(&self, name: &str, timeout: Duration) -> Result<u32, ElevateError> {
-        let start = Instant::now();
+        let mut deadline = Instant::now() + timeout;
+        let mut start_attempted = false;
+        let mut stopped_grace = 0u32;
+        let mut last_checkpoint = 0u32;
 
         loop {
-            if start.elapsed() > timeout {
+            if Instant::now() > deadline {
                 return Err(ElevateError::ServiceTimeout {
                     name: name.to_string(),
-                    seconds: start.elapsed().as_secs(),
+                    seconds: timeout.as_secs(),
                 });
             }
 
@@ -100,12 +108,41 @@ impl Service {
             let status =
                 unsafe { ptr::read_unaligned(raw_buf.0.as_ptr().cast::<SERVICE_STATUS_PROCESS>()) };
 
-            if status.dwCurrentState == SERVICE_RUNNING {
-                return Ok(status.dwProcessId);
+            match status.dwCurrentState {
+                SERVICE_RUNNING => return Ok(status.dwProcessId),
+                SERVICE_STOPPED => {
+                    if !start_attempted {
+                        self.try_start()?;
+                        start_attempted = true;
+                        // Allow brief grace period for SCM to transition out of stopped state.
+                        stopped_grace = STOPPED_GRACE_TICKS;
+                    } else if stopped_grace > 0 {
+                        // Consume grace ticks while waiting for SCM state synchronization.
+                        stopped_grace -= 1;
+                    } else {
+                        // Service remains stopped after grace period expires; consider it failed.
+                        return Err(ElevateError::ServiceFailed {
+                            name: name.to_string(),
+                        });
+                    }
+                }
+                SERVICE_START_PENDING => {
+                    // SCM acknowledged startup; clear stopped grace counter.
+                    stopped_grace = 0;
+
+                    // If checkpoint advances, the service is actively initializing; extend deadline.
+                    if status.dwCheckPoint > 0 && status.dwCheckPoint > last_checkpoint {
+                        last_checkpoint = status.dwCheckPoint;
+                        deadline = Instant::now() + timeout;
+                    }
+                }
+                // Intermediate states (e.g., STOP_PENDING): keep polling until timeout expires.
+                _ => {}
             }
 
-            let _ = self.try_start();
-            sleep(Duration::from_millis(200));
+            // Derive poll interval from wait hint per MSDN guidelines, clamped to reasonable bounds.
+            let wait_ms = (status.dwWaitHint / 10).clamp(1000, 3000);
+            sleep(Duration::from_millis(wait_ms as u64));
         }
     }
 
