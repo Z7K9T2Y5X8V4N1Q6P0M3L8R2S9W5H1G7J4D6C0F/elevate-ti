@@ -4,7 +4,7 @@
 
 **A safe, idiomatic Rust library to obtain Windows TrustedInstaller privileges.**
 
-[![Crates.io](https://img.shields.io/crates/v/elevate-ti?style=flat-square)](https://crates.io/crates/elevate-ti)
+[![Crates.io](https://img.shields.io/crates/v/elevate-ti?style=flat-square&cache_seconds=0)](https://crates.io/crates/elevate-ti)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=flat-square)](LICENSE-APACHE)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE-MIT)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?style=flat-square&logo=windows)](https://microsoft.com)

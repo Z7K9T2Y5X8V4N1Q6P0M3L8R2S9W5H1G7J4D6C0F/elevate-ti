@@ -28,6 +28,48 @@ use windows::{
 use super::{HandleGuard, token::Token, win32};
 use crate::error::ElevateError;
 
+/// Target desktop and window station configuration for the spawned process.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DesktopTarget {
+    /// Automatically resolve the target desktop based on token context:
+    /// - For Session 0 tokens: passes `NULL` (`None`) to avoid DACL access violations.
+    /// - For interactive sessions (1+): targets `WinSta0\Default`.
+    #[default]
+    Auto,
+
+    /// Attach to the primary interactive user desktop (`WinSta0\Default`).
+    InteractiveDefault,
+
+    /// Attach to the secure desktop (`WinSta0\Winlogon`), commonly used by UAC prompts and logon screens.
+    Winlogon,
+
+    /// Attach to the screensaver desktop (`WinSta0\Screen-Saver`).
+    Screensaver,
+
+    /// Explicitly pass `NULL` (`lpDesktop` not specified). Required for headless Session 0 contexts.
+    None,
+
+    /// A custom Window Station and Desktop object path (e.g., custom sandboxes or virtual displays).
+    Custom(String),
+}
+
+impl DesktopTarget {
+    /// Resolve the concrete `HSTRING` or `None` given the target session ID.
+    pub(crate) fn resolve(&self, session_id: Option<u32>) -> Option<HSTRING> {
+        match self {
+            Self::Auto => match session_id {
+                Some(0) | None => None,
+                Some(_) => Some(HSTRING::from("WinSta0\\Default")),
+            },
+            Self::InteractiveDefault => Some(HSTRING::from("WinSta0\\Default")),
+            Self::Winlogon => Some(HSTRING::from("WinSta0\\Winlogon")),
+            Self::Screensaver => Some(HSTRING::from("WinSta0\\Screen-Saver")),
+            Self::None => None,
+            Self::Custom(station) => Some(HSTRING::from(station.as_str())),
+        }
+    }
+}
+
 /// RAII guard for destroying the Win32 user environment block.
 struct EnvBlockGuard(*mut c_void);
 
@@ -47,7 +89,7 @@ pub struct TokenCommand {
     token: Token,
     exe: Option<PathBuf>,
     args: Option<String>,
-    desktop: HSTRING,
+    desktop: DesktopTarget,
 }
 
 impl TokenCommand {
@@ -57,7 +99,7 @@ impl TokenCommand {
             token,
             exe: None,
             args: None,
-            desktop: HSTRING::from("WinSta0\\Default"),
+            desktop: DesktopTarget::default(),
         }
     }
 
@@ -80,9 +122,11 @@ impl TokenCommand {
         self
     }
 
-    /// Set a custom desktop window station (defaults to `WinSta0\Default`).
-    pub fn desktop(mut self, station: &str) -> Self {
-        self.desktop = HSTRING::from(station);
+    /// Set the target desktop window station.
+    ///
+    /// Defaults to [`DesktopTarget::Auto`].
+    pub fn desktop(mut self, desktop: DesktopTarget) -> Self {
+        self.desktop = desktop;
         self
     }
 
@@ -109,9 +153,17 @@ impl TokenCommand {
         let cwd = env::current_dir()?;
         let cwd_hstr = HSTRING::from(cwd.as_os_str());
 
+        let session_id = self.token.session_id().ok();
+        let resolved_desktop = self.desktop.resolve(session_id);
+
+        let lp_desktop = match &resolved_desktop {
+            Some(d) => PWSTR(d.as_ptr().cast_mut()),
+            None => PWSTR::null(),
+        };
+
         let si = STARTUPINFOW {
             cb: mem::size_of::<STARTUPINFOW>() as u32,
-            lpDesktop: PWSTR(self.desktop.as_ptr().cast_mut()),
+            lpDesktop: lp_desktop,
             dwFlags: STARTF_USESHOWWINDOW,
             wShowWindow: SW_SHOWNORMAL.0 as u16,
             ..Default::default()

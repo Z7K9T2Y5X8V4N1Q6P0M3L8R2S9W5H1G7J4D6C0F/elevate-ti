@@ -4,8 +4,7 @@
 //!
 //! `elevate-ti` provides zero-cost, high-level abstractions to verify and acquire
 //! `NT SERVICE\TrustedInstaller` privileges on Windows, allowing processes to relaunch
-//! themselves or spawn sub-processes into active interactive desktops or headless
-//! background sessions.
+//! themselves or spawn sub-processes into the active interactive desktop session.
 
 pub mod error;
 pub mod security;
@@ -13,6 +12,8 @@ pub mod session;
 pub mod strategy;
 
 pub use error::ElevateError;
-pub use security::{ImpersonationGuard, Privilege, Sid, Token, TokenCommand, TokenType};
+pub use security::{
+    DesktopTarget, ImpersonationGuard, Privilege, Sid, Token, TokenCommand, TokenType,
+};
 pub use session::{ElevationStatus, elevated_command, relaunch, status};
 pub use strategy::{ElevationStrategy, SessionTarget, TrustedInstallerStrategy};

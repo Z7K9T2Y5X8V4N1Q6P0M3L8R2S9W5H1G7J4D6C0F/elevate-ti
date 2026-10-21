@@ -1,96 +1,112 @@
 //! End-to-end integration tests for elevate-ti privilege acquisition.
 
-use std::{env, time::Duration};
+use std::time::Duration;
 
 use elevate_ti::{
-    ElevationStatus, ElevationStrategy, Privilege, SessionTarget, Token, TokenCommand,
-    TrustedInstallerStrategy, status,
+    DesktopTarget, ElevationStatus, ElevationStrategy, Privilege, SessionTarget, Token,
+    TokenCommand, TrustedInstallerStrategy, status,
 };
+use windows::core::w;
 
-const PROBE_ARG_HEADLESS: &str = "--ti-probe-headless";
-const PROBE_ARG_INTERACTIVE: &str = "--ti-probe-interactive";
+/// `TrustedInstaller` Service Well-Known SID string (`NT SERVICE\TrustedInstaller`).
+const TRUSTED_INSTALLER_SID: windows::core::PCWSTR =
+    w!("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464");
 
-/// Shared fast-fail helper for tests requiring administrative privileges.
-fn can_run_elevated_tests() -> bool {
-    let Ok(current_token) = Token::current() else {
-        return false;
-    };
-    current_token.enable_privileges(&[Privilege::Debug]).is_ok()
+/// Fail-fast assertion verifying the test runner has genuine Administrator privileges and `SeDebugPrivilege`.
+fn assert_elevated_context() {
+    let current_token = Token::current().expect("Failed to open current process security token");
+
+    current_token.enable_privileges(&[Privilege::Debug]).expect(
+        "Test execution requires an elevated Administrator context with SeDebugPrivilege enabled. \
+             Please run 'cargo test' from an Administrator PowerShell/CMD prompt.",
+    );
 }
 
-/// Scenario 1: Headless / Session 0 Context (Task Scheduler, Background Services, CI).
+/// Baseline query validation ensuring status check operates predictably without panic.
 #[test]
-fn test_trusted_installer_session_zero_headless() {
-    let args: Vec<String> = env::args().collect();
-    if args.iter().any(|arg| arg == PROBE_ARG_HEADLESS) {
-        let child_status = status().expect("Subprocess must query status");
-        assert_eq!(
-            child_status,
-            ElevationStatus::Elevated,
-            "Session 0 child must possess genuine TrustedInstaller privileges"
-        );
-        std::process::exit(0);
-    }
+fn test_status_query_does_not_panic() {
+    let result = status();
+    assert!(result.is_ok(), "Querying elevation status must not fail");
+    let current_status = result.unwrap();
+    assert!(
+        matches!(
+            current_status,
+            ElevationStatus::RequiresElevation | ElevationStatus::Elevated
+        ),
+        "Status must return a valid elevation state variant"
+    );
+}
 
-    if !can_run_elevated_tests() {
-        eprintln!("[SKIP] Non-Admin context. Skipping Session 0 test.");
-        return;
-    }
+/// Headless / Session 0 token validation ensuring genuine `TrustedInstaller` privilege acquisition.
+#[test]
+fn test_acquire_primary_token_session_zero() {
+    assert_elevated_context();
 
-    // Explicitly testing NoSession (Session 0)
     let strategy = TrustedInstallerStrategy::new(Duration::from_secs(30), SessionTarget::NoSession);
-    let ti_token = strategy
+    let token = strategy
         .acquire_primary_token()
         .expect("Must acquire TrustedInstaller token in Session 0");
 
-    let current_exe = env::current_exe().expect("Must locate current test binary");
-    let cmd_line = format!("\"{}\" {}", current_exe.display(), PROBE_ARG_HEADLESS);
+    assert!(
+        token
+            .has_sid(TRUSTED_INSTALLER_SID)
+            .expect("Must query SID membership"),
+        "Acquired token must possess genuine TrustedInstaller SID"
+    );
 
-    TokenCommand::new(ti_token)
-        .exe(&current_exe)
-        .args(cmd_line)
-        .spawn()
-        .expect("Must successfully spawn child process in Session 0");
+    let session_id = token.session_id().expect("Must read session ID");
+    assert_eq!(
+        session_id, 0,
+        "NoSession target must strictly bind to Session 0"
+    );
 }
 
-/// Scenario 2: Interactive Desktop Context (Caller Session / GUI / `WinSta0\\Default`).
+/// Interactive caller session token validation ensuring proper desktop session binding.
 #[test]
-fn test_trusted_installer_interactive_session() {
-    let args: Vec<String> = env::args().collect();
-    if args.iter().any(|arg| arg == PROBE_ARG_INTERACTIVE) {
-        let child_status = status().expect("Subprocess must query status");
-        assert_eq!(
-            child_status,
-            ElevationStatus::Elevated,
-            "Interactive child must possess genuine TrustedInstaller privileges"
-        );
-        std::process::exit(0);
-    }
+fn test_acquire_primary_token_caller_session() {
+    assert_elevated_context();
 
-    if !can_run_elevated_tests() {
-        eprintln!("[SKIP] Non-Admin context. Skipping interactive session test.");
-        return;
-    }
-
-    // Default strategy uses CallerSession (breaks through to current user desktop)
     let strategy = TrustedInstallerStrategy::default();
-    let ti_token = match strategy.acquire_primary_token() {
-        Ok(token) => token,
-        Err(elevate_ti::ElevateError::SessionZeroNotSupported) => {
-            eprintln!(
-                "[SKIP] Running inside Session 0 (CI runner/headless); skipping interactive desktop test."
+    match strategy.acquire_primary_token() {
+        Ok(token) => {
+            assert!(
+                token
+                    .has_sid(TRUSTED_INSTALLER_SID)
+                    .expect("Must query SID membership"),
+                "Acquired token must possess genuine TrustedInstaller SID"
             );
-            return;
+
+            let caller_session = Token::current().unwrap().session_id().unwrap();
+            assert_eq!(
+                token.session_id().unwrap(),
+                caller_session,
+                "Token must match the caller's active interactive session ID"
+            );
+        }
+        Err(elevate_ti::ElevateError::SessionZeroNotSupported) => {
+            eprintln!("[INFO] Running inside Session 0 (CI runner/headless); fast-fail verified.");
         }
         Err(e) => panic!("Unexpected failure acquiring token for caller session: {e}"),
-    };
+    }
+}
 
-    let current_exe = env::current_exe().expect("Must locate current test binary");
-    let cmd_line = format!("\"{}\" {}", current_exe.display(), PROBE_ARG_INTERACTIVE);
+/// End-to-end child process execution verifying `DesktopTarget::Auto` DACL safety.
+#[test]
+fn test_spawn_child_execution() {
+    assert_elevated_context();
 
-    TokenCommand::new(ti_token)
-        .exe(&current_exe)
-        .args(cmd_line)
-        .spawn()
-        .expect("Must successfully spawn child process onto interactive desktop");
+    let strategy = TrustedInstallerStrategy::new(Duration::from_secs(30), SessionTarget::NoSession);
+    let token = strategy
+        .acquire_primary_token()
+        .expect("Must acquire primary token");
+
+    let cmd = TokenCommand::new(token)
+        .exe("%SystemRoot%\\System32\\cmd.exe")
+        .args("cmd.exe /c exit 0")
+        .desktop(DesktopTarget::Auto);
+
+    assert!(
+        cmd.spawn().is_ok(),
+        "Must spawn process with DesktopTarget::Auto without DACL or environment block failure"
+    );
 }
