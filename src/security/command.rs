@@ -28,45 +28,52 @@ use windows::{
 use super::{HandleGuard, token::Token, win32};
 use crate::error::ElevateError;
 
-/// Target desktop and window station configuration for the spawned process.
+/// Target interactive desktop window station.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum DesktopTarget {
-    /// Automatically resolve the target desktop based on token context:
-    /// - For Session 0 tokens: passes `NULL` (`None`) to avoid DACL access violations.
-    /// - For interactive sessions (1+): targets `WinSta0\Default`.
+pub enum InteractiveDesktop {
+    /// The standard interactive user desktop (`WinSta0\Default`).
     #[default]
-    Auto,
+    Default,
 
-    /// Attach to the primary interactive user desktop (`WinSta0\Default`).
-    InteractiveDefault,
-
-    /// Attach to the secure desktop (`WinSta0\Winlogon`), commonly used by UAC prompts and logon screens.
+    /// The secure desktop (`WinSta0\Winlogon`), active during UAC prompts and lock screens.
     Winlogon,
 
-    /// Attach to the screensaver desktop (`WinSta0\Screen-Saver`).
+    /// The screensaver desktop (`WinSta0\Screen-Saver`).
     Screensaver,
 
-    /// Explicitly pass `NULL` (`lpDesktop` not specified). Required for headless Session 0 contexts.
-    None,
-
-    /// A custom Window Station and Desktop object path (e.g., custom sandboxes or virtual displays).
+    /// A custom Window Station and Desktop object path (e.g. "`MyStation\\MyDesktop`").
     Custom(String),
 }
 
-impl DesktopTarget {
-    /// Resolve the concrete `HSTRING` or `None` given the target session ID.
-    pub(crate) fn resolve(&self, session_id: Option<u32>) -> Option<HSTRING> {
+impl InteractiveDesktop {
+    /// Create a custom window station and desktop target path.
+    pub fn custom(station_and_desktop: impl Into<String>) -> Self {
+        Self::Custom(station_and_desktop.into())
+    }
+
+    pub(crate) fn as_station_str(&self) -> &str {
         match self {
-            Self::Auto => match session_id {
-                Some(0) | None => None,
-                Some(_) => Some(HSTRING::from("WinSta0\\Default")),
-            },
-            Self::InteractiveDefault => Some(HSTRING::from("WinSta0\\Default")),
-            Self::Winlogon => Some(HSTRING::from("WinSta0\\Winlogon")),
-            Self::Screensaver => Some(HSTRING::from("WinSta0\\Screen-Saver")),
-            Self::None => None,
-            Self::Custom(station) => Some(HSTRING::from(station.as_str())),
+            Self::Default => "WinSta0\\Default",
+            Self::Winlogon => "WinSta0\\Winlogon",
+            Self::Screensaver => "WinSta0\\Screen-Saver",
+            Self::Custom(station) => station.as_str(),
         }
+    }
+}
+
+/// Process host environment context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionContext {
+    /// Run interactively attached to a specific desktop.
+    Interactive(InteractiveDesktop),
+
+    /// Run as a headless Session 0 process with no window station or desktop attached.
+    Headless,
+}
+
+impl Default for ExecutionContext {
+    fn default() -> Self {
+        Self::Interactive(InteractiveDesktop::default())
     }
 }
 
@@ -89,17 +96,18 @@ pub struct TokenCommand {
     token: Token,
     exe: Option<PathBuf>,
     args: Option<String>,
-    desktop: DesktopTarget,
+    desktop_str: Option<HSTRING>,
 }
 
 impl TokenCommand {
-    /// Create a new command builder bound to an elevated primary token.
-    pub fn new(token: Token) -> Self {
+    /// Create a new command builder bound to an elevated token and its target desktop context.
+    pub fn new(token: Token, desktop: Option<InteractiveDesktop>) -> Self {
+        let desktop_str = desktop.map(|d| HSTRING::from(d.as_station_str()));
         Self {
             token,
             exe: None,
             args: None,
-            desktop: DesktopTarget::default(),
+            desktop_str,
         }
     }
 
@@ -109,8 +117,7 @@ impl TokenCommand {
         Ok(self)
     }
 
-    /// Set a custom target executable path. Supports environment variable
-    /// references like `%SystemRoot%`, which are expanded immediately.
+    /// Set a custom target executable path. Supports environment variables like `%SystemRoot%`.
     pub fn exe(mut self, path: impl AsRef<Path>) -> Self {
         self.exe = Some(expand_env_path(path.as_ref()));
         self
@@ -119,14 +126,6 @@ impl TokenCommand {
     /// Pass a raw command-line string to the process.
     pub fn args(mut self, args: impl Into<String>) -> Self {
         self.args = Some(args.into());
-        self
-    }
-
-    /// Set the target desktop window station.
-    ///
-    /// Defaults to [`DesktopTarget::Auto`].
-    pub fn desktop(mut self, desktop: DesktopTarget) -> Self {
-        self.desktop = desktop;
         self
     }
 
@@ -153,10 +152,7 @@ impl TokenCommand {
         let cwd = env::current_dir()?;
         let cwd_hstr = HSTRING::from(cwd.as_os_str());
 
-        let session_id = self.token.session_id().ok();
-        let resolved_desktop = self.desktop.resolve(session_id);
-
-        let lp_desktop = match &resolved_desktop {
+        let lp_desktop = match &self.desktop_str {
             Some(d) => PWSTR(d.as_ptr().cast_mut()),
             None => PWSTR::null(),
         };
@@ -187,7 +183,6 @@ impl TokenCommand {
             &raw mut pi,
         ));
 
-        // Immediately transfer process and thread handles to RAII guards regardless of spawn outcome.
         let _process_guard = HandleGuard(pi.hProcess);
         let _thread_guard = HandleGuard(pi.hThread);
 
@@ -196,8 +191,6 @@ impl TokenCommand {
     }
 }
 
-/// Expand `%VAR%`-style environment variable references in a path.
-/// Falls back to the original path on failure.
 fn expand_env_path(path: &Path) -> PathBuf {
     let input = HSTRING::from(path.as_os_str());
 

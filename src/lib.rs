@@ -13,7 +13,10 @@ pub mod strategy;
 
 pub use error::ElevateError;
 pub use security::{
-    DesktopTarget, ImpersonationGuard, Privilege, Sid, Token, TokenCommand, TokenType,
+    ExecutionContext, ImpersonationGuard, InteractiveDesktop, Privilege, Sid, Token, TokenCommand,
+    TokenType,
 };
-pub use session::{ElevationStatus, elevated_command, relaunch, status};
+pub use session::{
+    ElevationStatus, elevated_command, elevated_command_on, headless_command, relaunch, status,
+};
 pub use strategy::{ElevationStrategy, SessionTarget, TrustedInstallerStrategy};

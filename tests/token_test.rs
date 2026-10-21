@@ -3,26 +3,23 @@
 use std::time::Duration;
 
 use elevate_ti::{
-    DesktopTarget, ElevationStatus, ElevationStrategy, Privilege, SessionTarget, Token,
-    TokenCommand, TrustedInstallerStrategy, status,
+    ElevationStatus, ElevationStrategy, ExecutionContext, Privilege, Token,
+    TrustedInstallerStrategy, headless_command, status,
 };
 use windows::core::w;
 
-/// `TrustedInstaller` Service Well-Known SID string (`NT SERVICE\TrustedInstaller`).
 const TRUSTED_INSTALLER_SID: windows::core::PCWSTR =
     w!("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464");
 
-/// Fail-fast assertion verifying the test runner has genuine Administrator privileges and `SeDebugPrivilege`.
 fn assert_elevated_context() {
     let current_token = Token::current().expect("Failed to open current process security token");
 
     current_token.enable_privileges(&[Privilege::Debug]).expect(
         "Test execution requires an elevated Administrator context with SeDebugPrivilege enabled. \
-             Please run 'cargo test' from an Administrator PowerShell/CMD prompt.",
+         Please run 'cargo test' from an Administrator PowerShell/CMD prompt.",
     );
 }
 
-/// Baseline query validation ensuring status check operates predictably without panic.
 #[test]
 fn test_status_query_does_not_panic() {
     let result = status();
@@ -37,12 +34,12 @@ fn test_status_query_does_not_panic() {
     );
 }
 
-/// Headless / Session 0 token validation ensuring genuine `TrustedInstaller` privilege acquisition.
 #[test]
 fn test_acquire_primary_token_session_zero() {
     assert_elevated_context();
 
-    let strategy = TrustedInstallerStrategy::new(Duration::from_secs(30), SessionTarget::NoSession);
+    let strategy =
+        TrustedInstallerStrategy::new(Duration::from_secs(30), ExecutionContext::Headless);
     let token = strategy
         .acquire_primary_token()
         .expect("Must acquire TrustedInstaller token in Session 0");
@@ -57,11 +54,10 @@ fn test_acquire_primary_token_session_zero() {
     let session_id = token.session_id().expect("Must read session ID");
     assert_eq!(
         session_id, 0,
-        "NoSession target must strictly bind to Session 0"
+        "Headless execution context must strictly bind to Session 0"
     );
 }
 
-/// Interactive caller session token validation ensuring proper desktop session binding.
 #[test]
 fn test_acquire_primary_token_caller_session() {
     assert_elevated_context();
@@ -90,23 +86,17 @@ fn test_acquire_primary_token_caller_session() {
     }
 }
 
-/// End-to-end child process execution verifying `DesktopTarget::Auto` DACL safety.
 #[test]
-fn test_spawn_child_execution() {
+fn test_spawn_headless_child_execution() {
     assert_elevated_context();
 
-    let strategy = TrustedInstallerStrategy::new(Duration::from_secs(30), SessionTarget::NoSession);
-    let token = strategy
-        .acquire_primary_token()
-        .expect("Must acquire primary token");
-
-    let cmd = TokenCommand::new(token)
+    let cmd = headless_command()
+        .expect("Must create headless command")
         .exe("%SystemRoot%\\System32\\cmd.exe")
-        .args("cmd.exe /c exit 0")
-        .desktop(DesktopTarget::Auto);
+        .args("cmd.exe /c exit 0");
 
     assert!(
         cmd.spawn().is_ok(),
-        "Must spawn process with DesktopTarget::Auto without DACL or environment block failure"
+        "Must spawn process in headless mode without DACL or environment block failure"
     );
 }

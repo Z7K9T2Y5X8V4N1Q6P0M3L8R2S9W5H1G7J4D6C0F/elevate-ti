@@ -43,7 +43,7 @@ pub enum ElevateError {
 
     /// Caller is running in Session 0 (non-interactive service context).
     #[error(
-        "Session 0 is not supported with CallerSession target; use SessionTarget::AnyInteractive, Explicit, or NoSession"
+        "Session 0 is not supported with CallerSession target; use SessionTarget::AnyInteractive, Explicit, or ExecutionContext::Headless"
     )]
     SessionZeroNotSupported,
 

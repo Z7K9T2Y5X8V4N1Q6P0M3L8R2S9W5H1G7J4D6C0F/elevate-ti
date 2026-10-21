@@ -7,7 +7,7 @@ pub mod sid;
 pub mod snapshot;
 pub mod token;
 
-pub use command::{DesktopTarget, TokenCommand};
+pub use command::{ExecutionContext, InteractiveDesktop, TokenCommand};
 pub use privilege::Privilege;
 pub use service::{Service, ServiceManager};
 pub use sid::Sid;
