@@ -2,7 +2,7 @@
 
 pub mod winlogon_ti;
 
-pub use winlogon_ti::TrustedInstallerStrategy;
+pub use winlogon_ti::{SessionTarget, TrustedInstallerStrategy};
 
 use crate::{error::ElevateError, security::Token};
 

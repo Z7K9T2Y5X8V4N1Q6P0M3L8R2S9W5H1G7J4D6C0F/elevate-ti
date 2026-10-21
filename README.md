@@ -5,7 +5,8 @@
 **A safe, idiomatic Rust library to obtain Windows TrustedInstaller privileges.**
 
 [![Crates.io](https://img.shields.io/crates/v/elevate-ti?style=flat-square)](https://crates.io/crates/elevate-ti)
-[![License: GPL-3.0](https://img.shields.io/badge/License-GPLv3-blue.svg?style=flat-square)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=flat-square)](LICENSE-APACHE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE-MIT)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?style=flat-square&logo=windows)](https://microsoft.com)
 [![Rust](https://img.shields.io/badge/Language-Rust_2024-dea584?style=flat-square&logo=rust)](https://rust-lang.org)
 
@@ -13,7 +14,7 @@
 
 ## Overview
 
-`elevate-ti` is an ergonomic Windows systems library designed to elevate privileges to `NT SERVICE\TrustedInstaller`. It isolates Session 0 services, acquires primary tokens via chained impersonation, and spawns processes directly onto the active user's interactive desktop (`WinSta0\Default`).
+`elevate-ti` is an ergonomic Windows systems library designed to elevate privileges to `NT SERVICE\TrustedInstaller`. It acquires primary tokens via chained impersonation, navigates Session 0 isolation, and supports launching processes either onto an active interactive desktop (`WinSta0\Default`) or within headless background sessions (CI, services, and tasks).
 
 ## Architecture Flow
 
@@ -22,11 +23,11 @@ Caller (Admin)
   │
   ├─> 1. Enable SeDebugPrivilege & SeImpersonatePrivilege
   ├─> 2. Ensure TrustedInstaller service is running (SCM)
-  ├─> 3. Locate winlogon.exe in caller session & impersonate SYSTEM
+  ├─> 3. Impersonate SYSTEM (via winlogon.exe or Session 0 SYSTEM process)
   │     └─> Duplicate TrustedInstaller Primary Token
-  │     └─> Bind Token to caller Session ID
+  │     └─> Optionally bind Token to target Session ID (Caller/Interactive/None)
   │
-  └─> 4. Spawn target process onto active desktop (WinSta0\Default)
+  └─> 4. Spawn target process (Interactive Desktop or Headless)
 ```
 
 ## Quickstart

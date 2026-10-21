@@ -33,6 +33,9 @@ jobs:
       - name: Documentation check
         run: cargo doc --no-deps
 
+      - name: Build tests without running
+        run: cargo test --no-run --verbose
+
   semver-check:
     name: Check SemVer Compatibility
     runs-on: windows-latest

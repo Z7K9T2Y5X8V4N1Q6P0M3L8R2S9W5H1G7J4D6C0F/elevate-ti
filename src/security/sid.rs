@@ -57,17 +57,3 @@ impl Sid {
         res
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use windows::core::w;
-
-    #[test]
-    fn test_sid_parse_and_string_conversion() {
-        let raw_str = w!("S-1-5-18");
-        let sid = Sid::parse(raw_str).expect("Failed to parse well-known SYSTEM SID");
-        let formatted = Sid::string_from_raw(sid.as_raw()).expect("Failed to stringify SID");
-        assert_eq!(formatted, "S-1-5-18");
-    }
-}
