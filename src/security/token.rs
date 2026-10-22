@@ -8,11 +8,13 @@ use windows::{
             CloseHandle, ERROR_SUCCESS, GetLastError, HANDLE, LUID, SetLastError, WIN32_ERROR,
         },
         Security::{
-            AdjustTokenPrivileges, DuplicateTokenEx, GetTokenInformation, ImpersonateLoggedOnUser,
-            LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, RevertToSelf, SE_PRIVILEGE_ENABLED,
-            SecurityImpersonation, SetTokenInformation, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES,
-            TOKEN_ALL_ACCESS, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_PRIVILEGES, TOKEN_QUERY,
-            TOKEN_USER, TokenGroups, TokenImpersonation, TokenPrimary, TokenSessionId, TokenUser,
+            AdjustTokenPrivileges, DuplicateTokenEx, GetSidSubAuthority, GetSidSubAuthorityCount,
+            GetTokenInformation, ImpersonateLoggedOnUser, IsTokenRestricted, LUID_AND_ATTRIBUTES,
+            LookupPrivilegeValueW, RevertToSelf, SE_PRIVILEGE_ENABLED, SecurityImpersonation,
+            SetTokenInformation, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_ALL_ACCESS,
+            TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_PRIVILEGES,
+            TOKEN_QUERY, TOKEN_USER, TokenGroups, TokenImpersonation, TokenIntegrityLevel,
+            TokenPrimary, TokenPrivileges, TokenSessionId, TokenUser,
         },
         System::{
             SystemServices::MAXIMUM_ALLOWED,
@@ -136,6 +138,55 @@ impl Token {
         Ok(())
     }
 
+    /// Check whether this token is a Restricted Token.
+    ///
+    /// In windows-rs 0.58, `IsTokenRestricted` returns `Result<(), windows::core::Error>`.
+    /// `Ok(())` indicates the token is restricted.
+    pub fn is_restricted(&self) -> Result<bool, ElevateError> {
+        Ok(unsafe { IsTokenRestricted(self.0) }.is_ok())
+    }
+
+    /// Query the Integrity Level RID of this token (e.g. 0x4000 = SYSTEM, 0x3000 = HIGH).
+    pub fn integrity_level(&self) -> Result<u32, ElevateError> {
+        let buf = self.query_info_buffer(TokenIntegrityLevel)?;
+        let label = unsafe { &*buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>() };
+
+        let count_ptr = unsafe { GetSidSubAuthorityCount(label.Label.Sid) };
+        if count_ptr.is_null() {
+            return Err(ElevateError::InvalidTokenBuffer);
+        }
+        let count = unsafe { *count_ptr };
+        if count == 0 {
+            return Err(ElevateError::InvalidTokenBuffer);
+        }
+
+        let sub_auth_ptr = unsafe { GetSidSubAuthority(label.Label.Sid, count as u32 - 1) };
+        if sub_auth_ptr.is_null() {
+            return Err(ElevateError::InvalidTokenBuffer);
+        }
+
+        Ok(unsafe { *sub_auth_ptr })
+    }
+
+    /// Check whether a specific privilege is present in this token's privilege table
+    /// (regardless of whether it is currently Enabled or Disabled).
+    pub fn has_privilege_present(&self, privilege: Privilege) -> Result<bool, ElevateError> {
+        let mut target_luid = LUID::default();
+        win32!(LookupPrivilegeValueW(
+            PCWSTR::null(),
+            privilege.as_pcwstr(),
+            &raw mut target_luid
+        ))?;
+
+        let buf = self.query_info_buffer(TokenPrivileges)?;
+        let privs = unsafe { &*buf.as_ptr().cast::<TOKEN_PRIVILEGES>() };
+        let slice = unsafe {
+            std::slice::from_raw_parts(privs.Privileges.as_ptr(), privs.PrivilegeCount as usize)
+        };
+
+        Ok(slice.iter().any(|p| p.Luid == target_luid))
+    }
+
     /// Query the Windows Session ID currently associated with this token.
     pub fn session_id(&self) -> Result<u32, ElevateError> {
         let mut session_id = 0u32;
@@ -199,8 +250,7 @@ impl Token {
             return Err(ElevateError::InvalidTokenBuffer);
         }
 
-        let usize_size = mem::size_of::<usize>();
-        let count = ((len as usize).saturating_add(usize_size - 1)) / usize_size;
+        let count = (len as usize).div_ceil(mem::size_of::<usize>());
         let mut buf: Vec<usize> = vec![0; count];
 
         win32!(GetTokenInformation(

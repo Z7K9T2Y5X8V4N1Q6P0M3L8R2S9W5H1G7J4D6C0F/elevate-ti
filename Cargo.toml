@@ -1,6 +1,6 @@
 [package]
 name = "elevate-ti"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 description = "A safe, idiomatic Rust library to obtain Windows TrustedInstaller privileges"
 repository = "https://github.com/Z7K9T2Y5X8V4N1Q6P0M3L8R2S9W5H1G7J4D6C0F/elevate-ti"
@@ -27,6 +27,7 @@ features = [
   "Win32_System_Environment",
   "Win32_System_RemoteDesktop",
   "Win32_System_Services",
+  "Win32_System_SystemInformation",
   "Win32_System_SystemServices",
   "Win32_System_Threading",
   "Win32_UI_WindowsAndMessaging",
