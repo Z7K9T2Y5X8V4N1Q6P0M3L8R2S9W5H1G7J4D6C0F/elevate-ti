@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Spawning an Elevated Child Process
+### Spawning an Elevated Child Process (Interactive Desktop)
 
 ```rust
 use elevate_ti::elevated_command;
@@ -68,6 +68,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+### Headless Execution (Session 0 / CI / Background Services)
+
+```rust
+use elevate_ti::headless_command;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    headless_command()?
+        .exe("%SystemRoot%\\System32\\cmd.exe")
+        .args("cmd.exe /c whoami /groups")
+        .spawn()?;
+
+    Ok(())
+}
+```
+
+## Examples
+
+For complete and runnable scenarios, check the [`examples`](examples) directory:
+
+- [`relaunch.rs`](examples/relaunch.rs): Automatic self-elevation and privilege verification.
+- [`spawn_cmd.rs`](examples/spawn_cmd.rs): Spawning interactive processes onto user or secure desktops.
+- [`headless_cmd.rs`](examples/headless_cmd.rs): Non-interactive background execution in Session 0.
 
 ## License
 
