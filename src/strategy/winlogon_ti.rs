@@ -3,6 +3,7 @@
 use std::{
     ffi::c_void,
     path::{Path, PathBuf},
+    slice,
     time::Duration,
 };
 
@@ -173,7 +174,7 @@ fn find_any_interactive_session() -> Result<u32, ElevateError> {
         return Err(ElevateError::NoInteractiveSession);
     }
 
-    let sessions = unsafe { std::slice::from_raw_parts(p_info, count as usize) };
+    let sessions = unsafe { slice::from_raw_parts(p_info, count as usize) };
     let console_session_id = unsafe { WTSGetActiveConsoleSessionId() };
 
     let mut candidate: Option<u32> = None;

@@ -1,7 +1,7 @@
 //! Windows Service Control Manager connection and service polling.
 
 use std::{
-    mem, ptr,
+    mem, slice,
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -25,10 +25,6 @@ use crate::error::ElevateError;
 /// Number of status queries tolerated where the state remains `SERVICE_STOPPED`
 /// immediately after `try_start()` returns successfully.
 const STOPPED_GRACE_TICKS: u32 = 3;
-
-/// Aligned stack storage matching the byte layout and alignment of `SERVICE_STATUS_PROCESS`.
-#[repr(C, align(8))]
-struct AlignedStatusBuffer([u8; mem::size_of::<SERVICE_STATUS_PROCESS>()]);
 
 /// Safe RAII wrapper for Service Control Manager connection.
 pub struct ServiceManager(SC_HANDLE);
@@ -94,19 +90,25 @@ impl Service {
                 });
             }
 
-            let mut raw_buf = AlignedStatusBuffer([0u8; mem::size_of::<SERVICE_STATUS_PROCESS>()]);
+            let mut status = SERVICE_STATUS_PROCESS::default();
             let mut bytes_needed = 0u32;
+
+            // SAFETY: SERVICE_STATUS_PROCESS is a plain-old-data (POD) struct composed entirely of DWORDs.
+            // Any byte pattern is valid, and casting it to a contiguous mutable byte slice covering its
+            // exact memory size is sound for the Windows API to populate.
+            let status_bytes = unsafe {
+                slice::from_raw_parts_mut(
+                    (&raw mut status).cast(),
+                    mem::size_of::<SERVICE_STATUS_PROCESS>(),
+                )
+            };
 
             win32!(QueryServiceStatusEx(
                 self.0,
                 SC_STATUS_PROCESS_INFO,
-                Some(&mut raw_buf.0),
+                Some(status_bytes),
                 &raw mut bytes_needed,
             ))?;
-
-            // SAFETY: SERVICE_STATUS_PROCESS is a plain data struct, buffer has identical size and alignment.
-            let status =
-                unsafe { ptr::read_unaligned(raw_buf.0.as_ptr().cast::<SERVICE_STATUS_PROCESS>()) };
 
             match status.dwCurrentState {
                 SERVICE_RUNNING => return Ok(status.dwProcessId),

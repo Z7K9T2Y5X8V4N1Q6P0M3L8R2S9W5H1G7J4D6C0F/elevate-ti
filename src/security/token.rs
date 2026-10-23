@@ -1,6 +1,6 @@
 //! Process and thread security token manipulation.
 
-use std::{mem, ptr};
+use std::{mem, ptr, slice};
 
 use windows::{
     Win32::{
@@ -179,17 +179,17 @@ impl Token {
         ))?;
 
         let buf = self.query_info_buffer(TokenPrivileges)?;
-
-        // SAFELY calculate the slice across the flexible array member using the buffer's base pointer.
-        // This avoids out-of-bounds pointer arithmetic UB caused by `Privileges: [LUID_AND_ATTRIBUTES; 1]`.
         let base = buf.as_ptr().cast::<TOKEN_PRIVILEGES>();
         let count = unsafe { (*base).PrivilegeCount as usize };
         if count == 0 {
             return Ok(false);
         }
 
-        let privs_ptr = unsafe { ptr::addr_of!((*base).Privileges).cast::<LUID_AND_ATTRIBUTES>() };
-        let slice = unsafe { std::slice::from_raw_parts(privs_ptr, count) };
+        // Calculate flexible array member start via byte offset to preserve full buffer provenance
+        // and avoid any type-narrowing semantics from `Privileges: [LUID_AND_ATTRIBUTES; 1]`.
+        let privs_offset = mem::offset_of!(TOKEN_PRIVILEGES, Privileges);
+        let privs_ptr = unsafe { base.byte_add(privs_offset).cast::<LUID_AND_ATTRIBUTES>() };
+        let slice = unsafe { slice::from_raw_parts(privs_ptr, count) };
 
         Ok(slice.iter().any(|p| p.Luid == target_luid))
     }
@@ -237,17 +237,17 @@ impl Token {
     pub fn has_sid(&self, target_sid: PCWSTR) -> Result<bool, ElevateError> {
         let target = Sid::parse(target_sid)?;
         let buf = self.query_info_buffer(TokenGroups)?;
-
-        // SAFELY calculate the slice across the flexible array member using the buffer's base pointer.
-        // This avoids out-of-bounds pointer arithmetic UB caused by `Groups: [SID_AND_ATTRIBUTES; 1]`.
         let base = buf.as_ptr().cast::<TOKEN_GROUPS>();
         let count = unsafe { (*base).GroupCount as usize };
         if count == 0 {
             return Ok(false);
         }
 
-        let groups_ptr = unsafe { ptr::addr_of!((*base).Groups).cast::<SID_AND_ATTRIBUTES>() };
-        let slice = unsafe { std::slice::from_raw_parts(groups_ptr, count) };
+        // Calculate flexible array member start via byte offset to preserve full buffer provenance
+        // and avoid any type-narrowing semantics from `Groups: [SID_AND_ATTRIBUTES; 1]`.
+        let groups_offset = mem::offset_of!(TOKEN_GROUPS, Groups);
+        let groups_ptr = unsafe { base.byte_add(groups_offset).cast::<SID_AND_ATTRIBUTES>() };
+        let slice = unsafe { slice::from_raw_parts(groups_ptr, count) };
 
         Ok(slice.iter().any(|g| Sid::equal(g.Sid, target.as_raw())))
     }
@@ -263,6 +263,8 @@ impl Token {
             return Err(ElevateError::InvalidTokenBuffer);
         }
 
+        // Vec<usize> guarantees pointer alignment (8 bytes on 64-bit, 4 bytes on 32-bit),
+        // which matches or exceeds the alignment requirements of all Win32 Token information classes.
         let count = (len as usize).div_ceil(mem::size_of::<usize>());
         let mut buf: Vec<usize> = vec![0; count];
 
