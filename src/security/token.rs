@@ -10,11 +10,11 @@ use windows::{
         Security::{
             AdjustTokenPrivileges, DuplicateTokenEx, GetSidSubAuthority, GetSidSubAuthorityCount,
             GetTokenInformation, ImpersonateLoggedOnUser, IsTokenRestricted, LUID_AND_ATTRIBUTES,
-            LookupPrivilegeValueW, RevertToSelf, SE_PRIVILEGE_ENABLED, SecurityImpersonation,
-            SetTokenInformation, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_ALL_ACCESS,
-            TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_PRIVILEGES,
-            TOKEN_QUERY, TOKEN_USER, TokenGroups, TokenImpersonation, TokenIntegrityLevel,
-            TokenPrimary, TokenPrivileges, TokenSessionId, TokenUser,
+            LookupPrivilegeValueW, RevertToSelf, SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES,
+            SecurityImpersonation, SetTokenInformation, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES,
+            TOKEN_ALL_ACCESS, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL,
+            TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, TokenGroups, TokenImpersonation,
+            TokenIntegrityLevel, TokenPrimary, TokenPrivileges, TokenSessionId, TokenUser,
         },
         System::{
             SystemServices::MAXIMUM_ALLOWED,
@@ -179,10 +179,17 @@ impl Token {
         ))?;
 
         let buf = self.query_info_buffer(TokenPrivileges)?;
-        let privs = unsafe { &*buf.as_ptr().cast::<TOKEN_PRIVILEGES>() };
-        let slice = unsafe {
-            std::slice::from_raw_parts(privs.Privileges.as_ptr(), privs.PrivilegeCount as usize)
-        };
+
+        // SAFELY calculate the slice across the flexible array member using the buffer's base pointer.
+        // This avoids out-of-bounds pointer arithmetic UB caused by `Privileges: [LUID_AND_ATTRIBUTES; 1]`.
+        let base = buf.as_ptr().cast::<TOKEN_PRIVILEGES>();
+        let count = unsafe { (*base).PrivilegeCount as usize };
+        if count == 0 {
+            return Ok(false);
+        }
+
+        let privs_ptr = unsafe { ptr::addr_of!((*base).Privileges).cast::<LUID_AND_ATTRIBUTES>() };
+        let slice = unsafe { std::slice::from_raw_parts(privs_ptr, count) };
 
         Ok(slice.iter().any(|p| p.Luid == target_luid))
     }
@@ -230,12 +237,18 @@ impl Token {
     pub fn has_sid(&self, target_sid: PCWSTR) -> Result<bool, ElevateError> {
         let target = Sid::parse(target_sid)?;
         let buf = self.query_info_buffer(TokenGroups)?;
-        // SAFETY: buf is pointer-aligned via Vec<usize> and populated by GetTokenInformation.
-        let groups = unsafe { &*buf.as_ptr().cast::<TOKEN_GROUPS>() };
 
-        let slice = unsafe {
-            std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize)
-        };
+        // SAFELY calculate the slice across the flexible array member using the buffer's base pointer.
+        // This avoids out-of-bounds pointer arithmetic UB caused by `Groups: [SID_AND_ATTRIBUTES; 1]`.
+        let base = buf.as_ptr().cast::<TOKEN_GROUPS>();
+        let count = unsafe { (*base).GroupCount as usize };
+        if count == 0 {
+            return Ok(false);
+        }
+
+        let groups_ptr = unsafe { ptr::addr_of!((*base).Groups).cast::<SID_AND_ATTRIBUTES>() };
+        let slice = unsafe { std::slice::from_raw_parts(groups_ptr, count) };
+
         Ok(slice.iter().any(|g| Sid::equal(g.Sid, target.as_raw())))
     }
 
