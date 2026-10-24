@@ -1,6 +1,6 @@
 //! Process and thread security token manipulation.
 
-use std::{mem, ptr, slice};
+use std::{marker::PhantomData, mem, ptr, slice};
 
 use windows::{
     Win32::{
@@ -139,9 +139,6 @@ impl Token {
     }
 
     /// Check whether this token is a Restricted Token.
-    ///
-    /// In windows-rs 0.58, `IsTokenRestricted` returns `Result<(), windows::core::Error>`.
-    /// `Ok(())` indicates the token is restricted.
     pub fn is_restricted(&self) -> Result<bool, ElevateError> {
         Ok(unsafe { IsTokenRestricted(self.0) }.is_ok())
     }
@@ -168,8 +165,7 @@ impl Token {
         Ok(unsafe { *sub_auth_ptr })
     }
 
-    /// Check whether a specific privilege is present in this token's privilege table
-    /// (regardless of whether it is currently Enabled or Disabled).
+    /// Check whether a specific privilege is present in this token's privilege table.
     pub fn has_privilege_present(&self, privilege: Privilege) -> Result<bool, ElevateError> {
         let mut target_luid = LUID::default();
         win32!(LookupPrivilegeValueW(
@@ -185,8 +181,6 @@ impl Token {
             return Ok(false);
         }
 
-        // Calculate flexible array member start via byte offset to preserve full buffer provenance
-        // and avoid any type-narrowing semantics from `Privileges: [LUID_AND_ATTRIBUTES; 1]`.
         let privs_offset = mem::offset_of!(TOKEN_PRIVILEGES, Privileges);
         let privs_ptr = unsafe { base.byte_add(privs_offset).cast::<LUID_AND_ATTRIBUTES>() };
         let slice = unsafe { slice::from_raw_parts(privs_ptr, count) };
@@ -219,16 +213,29 @@ impl Token {
         Ok(())
     }
 
-    /// Impersonate this token on the current thread, returning an RAII revert guard.
-    pub fn impersonate(&self) -> Result<ImpersonationGuard, ElevateError> {
+    /// Execute a scoped operation while impersonating this token on the current OS thread.
+    ///
+    /// Guarantees that the impersonation context is bound to the enclosing scope and
+    /// will always revert (`RevertToSelf`) on normal return or during panic unwinding.
+    pub fn with_impersonation<F, R>(&self, f: F) -> Result<R, ElevateError>
+    where
+        F: FnOnce() -> Result<R, ElevateError>,
+    {
+        let _guard = self.impersonate()?;
+        f()
+    }
+
+    /// Internal helper returning an RAII revert guard.
+    pub(crate) fn impersonate(&self) -> Result<ImpersonationGuard, ElevateError> {
         win32!(ImpersonateLoggedOnUser(self.0))?;
-        Ok(ImpersonationGuard)
+        Ok(ImpersonationGuard {
+            _marker: PhantomData,
+        })
     }
 
     /// Retrieve the owner user SID string of this token.
     pub fn user_sid(&self) -> Result<String, ElevateError> {
         let buf = self.query_info_buffer(TokenUser)?;
-        // SAFETY: buf is pointer-aligned via Vec<usize> and populated by GetTokenInformation.
         let user = unsafe { &*buf.as_ptr().cast::<TOKEN_USER>() };
         Sid::string_from_raw(user.User.Sid)
     }
@@ -243,8 +250,6 @@ impl Token {
             return Ok(false);
         }
 
-        // Calculate flexible array member start via byte offset to preserve full buffer provenance
-        // and avoid any type-narrowing semantics from `Groups: [SID_AND_ATTRIBUTES; 1]`.
         let groups_offset = mem::offset_of!(TOKEN_GROUPS, Groups);
         let groups_ptr = unsafe { base.byte_add(groups_offset).cast::<SID_AND_ATTRIBUTES>() };
         let slice = unsafe { slice::from_raw_parts(groups_ptr, count) };
@@ -263,8 +268,6 @@ impl Token {
             return Err(ElevateError::InvalidTokenBuffer);
         }
 
-        // Vec<usize> guarantees pointer alignment (8 bytes on 64-bit, 4 bytes on 32-bit),
-        // which matches or exceeds the alignment requirements of all Win32 Token information classes.
         let count = (len as usize).div_ceil(mem::size_of::<usize>());
         let mut buf: Vec<usize> = vec![0; count];
 
@@ -279,8 +282,13 @@ impl Token {
     }
 }
 
-/// RAII guard representing active thread impersonation.
-pub struct ImpersonationGuard;
+/// Internal RAII guard representing active thread impersonation.
+///
+/// Marked as `!Send` and `!Sync` to guarantee it cannot cross thread boundaries
+/// or `.await` suspension points.
+pub(crate) struct ImpersonationGuard {
+    _marker: PhantomData<*const ()>,
+}
 
 impl Drop for ImpersonationGuard {
     fn drop(&mut self) {
@@ -288,4 +296,10 @@ impl Drop for ImpersonationGuard {
             let _ = RevertToSelf();
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    static_assertions::assert_not_impl_any!(ImpersonationGuard: Send, Sync);
 }

@@ -12,7 +12,7 @@ pub use privilege::Privilege;
 pub use service::{Service, ServiceManager};
 pub use sid::Sid;
 pub use snapshot::ProcessSnapshot;
-pub use token::{ImpersonationGuard, Token, TokenType};
+pub use token::{Token, TokenType};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 

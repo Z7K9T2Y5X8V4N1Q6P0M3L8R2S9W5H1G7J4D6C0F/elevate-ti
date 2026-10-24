@@ -128,15 +128,16 @@ impl ElevationStrategy for TrustedInstallerStrategy {
             None => find_any_system_process()?,
         };
 
-        let _impersonation_guard = Token::from_pid(system_pid)?
-            .duplicate(TokenType::Impersonation)?
-            .impersonate()?;
+        let system_token = Token::from_pid(system_pid)?.duplicate(TokenType::Impersonation)?;
 
-        let ti_primary_token = Token::from_pid(ti_pid)?.duplicate(TokenType::Primary)?;
-
-        if let Some(session_id) = target_session {
-            ti_primary_token.set_session_id(session_id)?;
-        }
+        // Execute primary token duplication strictly within the bounded impersonation scope:
+        let ti_primary_token = system_token.with_impersonation(|| {
+            let token = Token::from_pid(ti_pid)?.duplicate(TokenType::Primary)?;
+            if let Some(session_id) = target_session {
+                token.set_session_id(session_id)?;
+            }
+            Ok(token)
+        })?;
 
         Ok(ti_primary_token)
     }
@@ -260,23 +261,19 @@ fn is_system32_binary(pid: u32, system32: &Path) -> bool {
 
 /// Verifies whether an opened Token has full, unrestricted SYSTEM capabilities.
 fn is_viable_system_token(token: &Token, target_session: Option<u32>) -> bool {
-    // 1. Must be genuine LOCAL SYSTEM
     let is_system = token.user_sid().is_ok_and(|sid| sid == LOCAL_SYSTEM_SID);
     if !is_system {
         return false;
     }
 
-    // 2. Must match the specified Session ID (if required)
     if target_session.is_some_and(|expected| !token.session_id().is_ok_and(|s| s == expected)) {
         return false;
     }
 
-    // 3. Must not be a Restricted Token
     if token.is_restricted().unwrap_or(true) {
         return false;
     }
 
-    // 4. Must possess System Integrity Level (RID >= 0x4000)
     let is_system_il = token
         .integrity_level()
         .is_ok_and(|il| il >= SECURITY_MANDATORY_SYSTEM_RID as u32);
@@ -284,7 +281,6 @@ fn is_viable_system_token(token: &Token, target_session: Option<u32>) -> bool {
         return false;
     }
 
-    // 5. Must hold Impersonate privilege capability (not stripped by SCM)
     token
         .has_privilege_present(Privilege::Impersonate)
         .unwrap_or(false)
@@ -311,7 +307,6 @@ fn find_system_process(process_name: &str, session_id: u32) -> Result<u32, Eleva
 }
 
 fn find_any_system_process() -> Result<u32, ElevateError> {
-    // Stage 1: Fast-path via known core SYSTEM services in Session 0 strictly rooted in System32
     if let Some(system32) = get_system32_directory() {
         for &target_name in SESSION0_PREFERRED_SYSTEM_PROCESSES {
             for (pid, name) in ProcessSnapshot::new()? {
@@ -325,7 +320,6 @@ fn find_any_system_process() -> Result<u32, ElevateError> {
         }
     }
 
-    // Stage 2: Fallback scan over all Session 0 processes with strict token verification
     let current_pid = std::process::id();
     let mut best: Option<u32> = None;
 

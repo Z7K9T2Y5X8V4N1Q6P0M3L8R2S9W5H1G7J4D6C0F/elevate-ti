@@ -13,8 +13,7 @@ pub mod strategy;
 
 pub use error::ElevateError;
 pub use security::{
-    ExecutionContext, ImpersonationGuard, InteractiveDesktop, Privilege, Sid, Token, TokenCommand,
-    TokenType,
+    ExecutionContext, InteractiveDesktop, Privilege, Sid, Token, TokenCommand, TokenType,
 };
 pub use session::{
     ElevationStatus, elevated_command, elevated_command_on, headless_command, relaunch, status,
