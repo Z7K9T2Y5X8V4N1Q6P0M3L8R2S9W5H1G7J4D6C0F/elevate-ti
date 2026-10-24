@@ -110,6 +110,13 @@ impl TrustedInstallerStrategy {
 impl ElevationStrategy for TrustedInstallerStrategy {
     fn acquire_primary_token(&self) -> Result<Token, ElevateError> {
         let current_token = Token::current()?;
+
+        // Fast-fail before attempting SCM or system process operations:
+        // Check if the calling process is elevated as Administrator.
+        if !current_token.is_elevated_admin()? {
+            return Err(ElevateError::AdministratorRequired);
+        }
+
         current_token.enable_privileges(&[Privilege::Debug, Privilege::Impersonate])?;
 
         let target_session = match self.context {

@@ -17,9 +17,20 @@ pub enum ElevateError {
         source: windows::core::Error,
     },
 
-    /// A required Windows privilege could not be enabled.
-    #[error("Privilege '{0}' could not be assigned")]
-    PrivilegeNotAssigned(&'static str),
+    /// The calling process is not running with elevated Administrator privileges.
+    #[error(
+        "Administrator privileges required: process must be run as Administrator (elevated) to acquire TrustedInstaller privileges"
+    )]
+    AdministratorRequired,
+
+    /// A required Windows privilege is not held by the process token.
+    #[error(
+        "Privilege '{privilege}' is not held by the process token (run as Administrator to obtain it)"
+    )]
+    PrivilegeNotHeld {
+        /// Name of the missing privilege (e.g. `SeDebugPrivilege`).
+        privilege: &'static str,
+    },
 
     /// A required genuine Windows SYSTEM process was not found.
     #[error("Required system process '{0}' was not found in active session")]

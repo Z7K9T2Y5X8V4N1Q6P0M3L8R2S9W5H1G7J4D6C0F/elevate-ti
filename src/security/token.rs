@@ -12,9 +12,10 @@ use windows::{
             GetTokenInformation, ImpersonateLoggedOnUser, IsTokenRestricted, LUID_AND_ATTRIBUTES,
             LookupPrivilegeValueW, RevertToSelf, SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES,
             SecurityImpersonation, SetTokenInformation, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES,
-            TOKEN_ALL_ACCESS, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL,
-            TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, TokenGroups, TokenImpersonation,
-            TokenIntegrityLevel, TokenPrimary, TokenPrivileges, TokenSessionId, TokenUser,
+            TOKEN_ALL_ACCESS, TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS,
+            TOKEN_MANDATORY_LABEL, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, TokenElevation,
+            TokenGroups, TokenImpersonation, TokenIntegrityLevel, TokenPrimary, TokenPrivileges,
+            TokenSessionId, TokenUser,
         },
         System::{
             SystemServices::MAXIMUM_ALLOWED,
@@ -104,6 +105,9 @@ impl Token {
     }
 
     /// Enable the specified administrative privileges on this token.
+    ///
+    /// If the token does not hold the privilege (e.g. running as non-elevated user),
+    /// this returns [`ElevateError::PrivilegeNotHeld`].
     pub fn enable_privileges(&self, privileges: &[Privilege]) -> Result<(), ElevateError> {
         for &privilege in privileges {
             let mut luid = LUID::default();
@@ -131,11 +135,31 @@ impl Token {
                 None,
             ))?;
 
+            // AdjustTokenPrivileges returns TRUE even if privileges were not assigned
+            // (ERROR_NOT_ALL_ASSIGNED), which indicates the token does not hold this privilege.
             if unsafe { GetLastError() } != ERROR_SUCCESS {
-                return Err(ElevateError::PrivilegeNotAssigned(privilege.as_str()));
+                return Err(ElevateError::PrivilegeNotHeld {
+                    privilege: privilege.as_str(),
+                });
             }
         }
         Ok(())
+    }
+
+    /// Check whether this token is running with elevated Administrator privileges.
+    pub fn is_elevated_admin(&self) -> Result<bool, ElevateError> {
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+
+        win32!(GetTokenInformation(
+            self.0,
+            TokenElevation,
+            Some(ptr::from_mut(&mut elevation).cast()),
+            mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &raw mut len
+        ))?;
+
+        Ok(elevation.TokenIsElevated != 0)
     }
 
     /// Check whether this token is a Restricted Token.
