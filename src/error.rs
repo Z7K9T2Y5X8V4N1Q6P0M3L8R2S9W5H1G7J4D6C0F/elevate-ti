@@ -37,10 +37,21 @@ pub enum ElevateError {
     ProcessNotFound(String),
 
     /// A Windows service failed to start or entered a failed state.
-    #[error("Service '{name}' failed unexpectedly")]
+    #[error(
+        "Service '{name}' failed unexpectedly (win32 exit code: {exit_code}{})",
+        if *exit_code == 1066 {
+            format!(", service-specific exit code: {service_exit_code}")
+        } else {
+            String::new()
+        }
+    )]
     ServiceFailed {
         /// Name of the target service.
         name: String,
+        /// Win32 exit code reported by the service (`dwWin32ExitCode`).
+        exit_code: u32,
+        /// Service-specific exit code reported by the service (`dwServiceSpecificExitCode`).
+        service_exit_code: u32,
     },
 
     /// Waiting for a service to reach running state timed out.
@@ -58,7 +69,7 @@ pub enum ElevateError {
     )]
     SessionZeroNotSupported,
 
-    /// No active interactive session with a logged-on user was found.
+    /// No interactive session with a logged-on user was found.
     #[error("No interactive desktop session available on this machine")]
     NoInteractiveSession,
 

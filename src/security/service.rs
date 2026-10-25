@@ -22,9 +22,12 @@ use windows::{
 use super::win32;
 use crate::error::ElevateError;
 
-/// Number of status queries tolerated where the state remains `SERVICE_STOPPED`
+/// Maximum duration tolerated for SCM to remain in `SERVICE_STOPPED`
 /// immediately after `try_start()` returns successfully.
-const STOPPED_GRACE_TICKS: u32 = 3;
+const STOPPED_GRACE: Duration = Duration::from_millis(1500);
+
+/// Polling interval during the initial startup grace period.
+const GRACE_POLL: Duration = Duration::from_millis(250);
 
 /// Safe RAII wrapper for Service Control Manager connection.
 pub struct ServiceManager(SC_HANDLE);
@@ -79,11 +82,12 @@ impl Service {
     pub fn start_and_wait(&self, name: &str, timeout: Duration) -> Result<u32, ElevateError> {
         let mut deadline = Instant::now() + timeout;
         let mut start_attempted = false;
-        let mut stopped_grace = 0u32;
+        let mut stopped_since: Option<Instant> = None;
         let mut last_checkpoint = 0u32;
 
         loop {
-            if Instant::now() > deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 return Err(ElevateError::ServiceTimeout {
                     name: name.to_string(),
                     seconds: timeout.as_secs(),
@@ -112,25 +116,27 @@ impl Service {
 
             match status.dwCurrentState {
                 SERVICE_RUNNING => return Ok(status.dwProcessId),
-                SERVICE_STOPPED => {
-                    if !start_attempted {
+                SERVICE_STOPPED => match stopped_since {
+                    // Initial stopped state: trigger start and mark the beginning of the grace period.
+                    None if !start_attempted => {
                         self.try_start()?;
                         start_attempted = true;
-                        // Allow brief grace period for SCM to transition out of stopped state.
-                        stopped_grace = STOPPED_GRACE_TICKS;
-                    } else if stopped_grace > 0 {
-                        // Consume grace ticks while waiting for SCM state synchronization.
-                        stopped_grace -= 1;
-                    } else {
-                        // Service remains stopped after grace period expires; consider it failed.
+                        stopped_since = Some(Instant::now());
+                    }
+                    // Within grace period: SCM may still be transitioning state. Keep checking.
+                    Some(start_time) if start_time.elapsed() < STOPPED_GRACE => {}
+                    // Grace period expired or service stopped again after transitioning: failure confirmed.
+                    _ => {
                         return Err(ElevateError::ServiceFailed {
                             name: name.to_string(),
+                            exit_code: status.dwWin32ExitCode,
+                            service_exit_code: status.dwServiceSpecificExitCode,
                         });
                     }
-                }
+                },
                 SERVICE_START_PENDING => {
-                    // SCM acknowledged startup; clear stopped grace counter.
-                    stopped_grace = 0;
+                    // SCM acknowledged startup; clear the stopped grace tracking.
+                    stopped_since = None;
 
                     // If checkpoint advances, the service is actively initializing; extend deadline.
                     if status.dwCheckPoint > 0 && status.dwCheckPoint > last_checkpoint {
@@ -138,13 +144,26 @@ impl Service {
                         deadline = Instant::now() + timeout;
                     }
                 }
+
                 // Intermediate states (e.g., STOP_PENDING): keep polling until timeout expires.
                 _ => {}
             }
 
-            // Derive poll interval from wait hint per MSDN guidelines, clamped to reasonable bounds.
-            let wait_ms = (status.dwWaitHint / 10).clamp(1000, 3000);
-            sleep(Duration::from_millis(wait_ms as u64));
+            // Polling interval:
+            // - During SCM state transition grace period: fast 250ms polling for prompt response.
+            // - During normal pending/running transition: MSDN-guided wait hint (1~3s).
+            let target_interval = if stopped_since.is_some() {
+                GRACE_POLL
+            } else {
+                Duration::from_millis((status.dwWaitHint / 10).clamp(1000, 3000) as u64)
+            };
+
+            // Ensure sleep interval never overshoots the overall deadline.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                continue;
+            }
+            sleep(target_interval.min(remaining));
         }
     }
 
