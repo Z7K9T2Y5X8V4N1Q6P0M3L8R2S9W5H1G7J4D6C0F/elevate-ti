@@ -1,6 +1,7 @@
 //! Advanced Windows privilege elevation strategy supporting both interactive and headless contexts.
 
 use std::{
+    collections::HashSet,
     ffi::c_void,
     path::{Path, PathBuf},
     slice,
@@ -28,7 +29,7 @@ use windows::{
 };
 
 use crate::{
-    error::ElevateError,
+    error::{ElevateError, ProcessAccessFailure, ProcessDiagnostic},
     security::{
         ExecutionContext, HandleGuard, Privilege, ProcessSnapshot, ServiceManager, Token,
         TokenType, win32,
@@ -38,9 +39,12 @@ use crate::{
 
 const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
 
-/// Preferred core system services in Session 0 guaranteed to run with full SYSTEM privileges.
-/// lsass.exe is deliberately avoided to minimize EDR/AV handle inspection interference.
-const SESSION0_PREFERRED_SYSTEM_PROCESSES: &[&str] = &["services.exe", "wininit.exe"];
+/// The canonical Session 0 SYSTEM process used as the elevation pivot.
+///
+/// `services.exe` is explicitly selected because it is not subjected to PPL (Protected Process Light)
+/// protections in modern Windows (unlike `lsass.exe` with RunAs-PPL or `wininit.exe` with WinTCB-Light),
+/// ensuring unrestricted token access under `SeDebugPrivilege`.
+const DEFAULT_SYSTEM_PROCESS: &str = "services.exe";
 
 struct WtsMemoryGuard(*mut c_void);
 
@@ -71,6 +75,7 @@ pub struct TrustedInstallerStrategy {
     service_timeout: Duration,
     context: ExecutionContext,
     session_target: SessionTarget,
+    preferred_system_process: String,
 }
 
 impl Default for TrustedInstallerStrategy {
@@ -79,6 +84,7 @@ impl Default for TrustedInstallerStrategy {
             service_timeout: Duration::from_secs(30),
             context: ExecutionContext::default(),
             session_target: SessionTarget::default(),
+            preferred_system_process: DEFAULT_SYSTEM_PROCESS.to_string(),
         }
     }
 }
@@ -90,7 +96,15 @@ impl TrustedInstallerStrategy {
             service_timeout,
             context,
             session_target: SessionTarget::CallerSession,
+            preferred_system_process: DEFAULT_SYSTEM_PROCESS.to_string(),
         }
+    }
+
+    /// Override or append custom candidate Session 0 SYSTEM process names.
+    #[must_use]
+    pub fn with_preferred_processes(mut self, process: impl Into<String>) -> Self {
+        self.preferred_system_process = process.into();
+        self
     }
 
     /// Configure a custom session target policy for interactive contexts.
@@ -105,14 +119,99 @@ impl TrustedInstallerStrategy {
     pub const fn context(&self) -> &ExecutionContext {
         &self.context
     }
+
+    /// Resolves an accessible, unrestricted SYSTEM process in Session 0 via a two-stage scan.
+    fn resolve_system_process(&self) -> Result<u32, ElevateError> {
+        let system32 = get_system32_directory().ok_or_else(|| {
+            ElevateError::ProcessNotFound("system32 directory unresolvable".to_string())
+        })?;
+
+        // Snapshot is collected into an owned vector to allow multiple iterations
+        // without consuming or attempting to clone non-cloneable Win32 handles.
+        let processes: Vec<(u32, String)> = ProcessSnapshot::new()?.collect();
+        let mut diagnostics = Vec::new();
+        let mut checked_pids = HashSet::new();
+
+        // Stage 1: Inspect the single preferred system process (default: services.exe)
+        for &(pid, ref name) in &processes {
+            if !name.eq_ignore_ascii_case(&self.preferred_system_process) {
+                continue;
+            }
+
+            checked_pids.insert(pid);
+
+            if !is_system32_binary(pid, &system32) {
+                diagnostics.push(ProcessDiagnostic {
+                    pid,
+                    name: name.clone(),
+                    reason: ProcessAccessFailure::NotInSystem32,
+                });
+                continue;
+            }
+
+            match Token::from_pid(pid) {
+                Ok(token) => {
+                    if is_viable_system_token(&token, Some(0)) {
+                        return Ok(pid);
+                    }
+                    diagnostics.push(ProcessDiagnostic {
+                        pid,
+                        name: name.clone(),
+                        reason: ProcessAccessFailure::InsufficientPrivileges,
+                    });
+                }
+                Err(e) => {
+                    diagnostics.push(ProcessDiagnostic {
+                        pid,
+                        name: name.clone(),
+                        reason: e.to_access_failure(),
+                    });
+                }
+            }
+        }
+
+        // Stage 2: Fallback scan across all accessible Session 0 processes
+        let current_pid = std::process::id();
+        for &(pid, ref name) in &processes {
+            if pid <= 4 || pid == current_pid || checked_pids.contains(&pid) {
+                continue;
+            }
+
+            // Both stages enforce system32 physical path validation for defense-in-depth
+            if !is_system32_binary(pid, &system32) {
+                continue;
+            }
+
+            match Token::from_pid(pid) {
+                Ok(token) => {
+                    if is_viable_system_token(&token, Some(0)) {
+                        return Ok(pid);
+                    }
+                    // Deliberate design decision:
+                    // In Stage 2, processes that are accessible but lack SYSTEM privileges (e.g.
+                    // network services or non-admin worker tokens) are expected and therefore
+                    // skipped without recording to avoid polluting the diagnostic report.
+                }
+                Err(e) => {
+                    // Security blocks (e.g. AccessDenied from PPL/EDR) are recorded for troubleshooting.
+                    diagnostics.push(ProcessDiagnostic {
+                        pid,
+                        name: name.clone(),
+                        reason: e.to_access_failure(),
+                    });
+                }
+            }
+        }
+
+        Err(ElevateError::NoViableSystemProcess { diagnostics })
+    }
 }
 
 impl ElevationStrategy for TrustedInstallerStrategy {
     fn acquire_primary_token(&self) -> Result<Token, ElevateError> {
         let current_token = Token::current()?;
 
-        // Fast-fail before attempting SCM or system process operations:
-        // Check if the calling process is elevated as Administrator.
+        // Fast-fail before attempting SCM or system process operations
         if !current_token.is_elevated_admin()? {
             return Err(ElevateError::AdministratorRequired);
         }
@@ -130,18 +229,28 @@ impl ElevationStrategy for TrustedInstallerStrategy {
             .service(w!("TrustedInstaller"))?
             .start_and_wait("TrustedInstaller", self.service_timeout)?;
 
-        let system_pid = match target_session {
-            Some(session_id) => find_system_process("winlogon.exe", session_id)?,
-            None => find_any_system_process()?,
-        };
-
+        // Resolve an accessible SYSTEM process entirely from Session 0,
+        // avoiding PPL locks on interactive winlogon.exe or lsass.exe.
+        let system_pid = self.resolve_system_process()?;
         let system_token = Token::from_pid(system_pid)?.duplicate(TokenType::Impersonation)?;
 
-        // Execute primary token duplication strictly within the bounded impersonation scope:
+        // Execute primary token duplication strictly within the bounded impersonation scope.
+        // Impersonating SYSTEM grants SeTcbPrivilege, permitting explicit TokenSessionId reassignment.
         let ti_primary_token = system_token.with_impersonation(|| {
             let token = Token::from_pid(ti_pid)?.duplicate(TokenType::Primary)?;
-            if let Some(session_id) = target_session {
-                token.set_session_id(session_id)?;
+
+            if let Some(expected_session) = target_session {
+                token.set_session_id(expected_session)?;
+
+                // Readback verification: ensure the session assignment took effect in kernel space
+                // and did not silently fail to prevent silent Session 0 window drop.
+                let actual_session = token.session_id()?;
+                if actual_session != expected_session {
+                    return Err(ElevateError::SessionBindingFailed {
+                        expected: expected_session,
+                        actual: actual_session,
+                    });
+                }
             }
             Ok(token)
         })?;
@@ -291,60 +400,4 @@ fn is_viable_system_token(token: &Token, target_session: Option<u32>) -> bool {
     token
         .has_privilege_present(Privilege::Impersonate)
         .unwrap_or(false)
-}
-
-fn find_system_process(process_name: &str, session_id: u32) -> Result<u32, ElevateError> {
-    let system32 = get_system32_directory().ok_or_else(|| {
-        ElevateError::ProcessNotFound("system32 directory unresolvable".to_string())
-    })?;
-
-    for (pid, name) in ProcessSnapshot::new()? {
-        if !name.eq_ignore_ascii_case(process_name) {
-            continue;
-        }
-
-        if is_system32_binary(pid, &system32)
-            && Token::from_pid(pid).is_ok_and(|t| is_viable_system_token(&t, Some(session_id)))
-        {
-            return Ok(pid);
-        }
-    }
-
-    Err(ElevateError::ProcessNotFound(process_name.to_string()))
-}
-
-fn find_any_system_process() -> Result<u32, ElevateError> {
-    if let Some(system32) = get_system32_directory() {
-        for &target_name in SESSION0_PREFERRED_SYSTEM_PROCESSES {
-            for (pid, name) in ProcessSnapshot::new()? {
-                if name.eq_ignore_ascii_case(target_name)
-                    && is_system32_binary(pid, &system32)
-                    && Token::from_pid(pid).is_ok_and(|t| is_viable_system_token(&t, Some(0)))
-                {
-                    return Ok(pid);
-                }
-            }
-        }
-    }
-
-    let current_pid = std::process::id();
-    let mut best: Option<u32> = None;
-
-    for (pid, _) in ProcessSnapshot::new()? {
-        if pid == current_pid || pid <= 4 {
-            continue;
-        }
-
-        let Ok(token) = Token::from_pid(pid) else {
-            continue;
-        };
-
-        if is_viable_system_token(&token, Some(0)) {
-            best = Some(best.map_or(pid, |prev| prev.min(pid)));
-        }
-    }
-
-    best.ok_or_else(|| {
-        ElevateError::ProcessNotFound("viable unrestricted Session 0 SYSTEM process".to_string())
-    })
 }

@@ -2,6 +2,59 @@
 
 use std::io;
 use thiserror::Error;
+use windows::Win32::Foundation::E_ACCESSDENIED;
+
+/// Cause of process or token acquisition failure.
+///
+/// Designed as a pure scalar structure without external crate dependencies,
+/// supporting direct programmatic pattern matching and serialization.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ProcessAccessFailure {
+    /// The binary backing the target process is located outside the canonical System32 directory.
+    #[error("Binary path is outside canonical System32")]
+    NotInSystem32,
+
+    /// The token was accessible, but lacks SYSTEM SID, requisite privileges, or integrity level.
+    #[error("Token accessible, but lacks SYSTEM rights or privileges")]
+    InsufficientPrivileges,
+
+    /// Explicit kernel-level access denial (0x80070005), typically caused by PPL, VBS, or EDR/AV drivers.
+    #[error("Access denied [0x{hresult:08X}: {message}] (PPL/VBS/EDR intervention)")]
+    AccessDenied {
+        /// Underlying Win32 HRESULT code.
+        hresult: u32,
+        /// Formatted error message text.
+        message: String,
+    },
+
+    /// Other Win32 API failure with an explicit HRESULT code.
+    #[error("Win32 Error [0x{hresult:08X}: {message}]")]
+    Win32Error {
+        /// Underlying Win32 HRESULT code.
+        hresult: u32,
+        /// Formatted error message text.
+        message: String,
+    },
+
+    /// Non-Win32 or internal logic error without an HRESULT code.
+    #[error("Error: {message}")]
+    InternalError {
+        /// Formatted error message text.
+        message: String,
+    },
+}
+
+/// Diagnostic item for an individual candidate process inspected during SYSTEM token resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("PID {pid} ({name}): {reason}")]
+pub struct ProcessDiagnostic {
+    /// Process ID (PID) of the candidate process.
+    pub pid: u32,
+    /// Executable name of the candidate process (e.g. `services.exe`).
+    pub name: String,
+    /// Concrete reason why the process could not be utilized.
+    pub reason: ProcessAccessFailure,
+}
 
 /// The central error type for all privilege elevation and Windows security operations.
 #[derive(Debug, Error)]
@@ -84,4 +137,61 @@ pub enum ElevateError {
     /// A query to token information returned corrupted or out-of-bounds data.
     #[error("Token information buffer is invalid or empty")]
     InvalidTokenBuffer,
+
+    /// Binding token to the target Windows Session ID failed post-verification readback.
+    #[error(
+        "Session ID mismatch: requested binding to session {expected}, but verified as {actual}"
+    )]
+    SessionBindingFailed {
+        /// Requested session ID.
+        expected: u32,
+        /// Actual session ID read back from the token.
+        actual: u32,
+    },
+
+    /// All candidate SYSTEM processes in Session 0 could not be accessed.
+    #[error(
+            "Failed to acquire a viable SYSTEM token. Inspected {} candidate(s):{}",
+            diagnostics.len(),
+            format_diagnostics(diagnostics)
+        )]
+    NoViableSystemProcess {
+        /// Full diagnostic log detailing why each inspected candidate was rejected.
+        diagnostics: Vec<ProcessDiagnostic>,
+    },
+}
+
+fn format_diagnostics(diagnostics: &[ProcessDiagnostic]) -> String {
+    if diagnostics.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n  * {}",
+        diagnostics
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n  * ")
+    )
+}
+
+impl ElevateError {
+    /// Normalizes any error variant into a structured [`ProcessAccessFailure`].
+    pub(crate) fn to_access_failure(&self) -> ProcessAccessFailure {
+        match self {
+            Self::Win32 { source, .. } => {
+                let hresult = source.code().0 as u32;
+                let message = format!("{source}");
+
+                if source.code() == E_ACCESSDENIED {
+                    ProcessAccessFailure::AccessDenied { hresult, message }
+                } else {
+                    ProcessAccessFailure::Win32Error { hresult, message }
+                }
+            }
+            other => ProcessAccessFailure::InternalError {
+                message: other.to_string(),
+            },
+        }
+    }
 }
