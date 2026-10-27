@@ -149,22 +149,25 @@ impl TrustedInstallerStrategy {
                 continue;
             }
 
-            match Token::from_pid(pid) {
-                Ok(token) => {
-                    if is_viable_system_token(&token, Some(0)) {
-                        return Ok(pid);
-                    }
-                    diagnostics.push(ProcessDiagnostic {
-                        pid,
-                        name: name.clone(),
-                        reason: ProcessAccessFailure::InsufficientPrivileges,
-                    });
-                }
+            let token = match Token::from_pid(pid) {
+                Ok(token) => token,
                 Err(e) => {
                     diagnostics.push(ProcessDiagnostic {
                         pid,
                         name: name.clone(),
                         reason: e.to_access_failure(),
+                    });
+                    continue;
+                }
+            };
+
+            match verify_system_token(&token, Some(0)) {
+                Ok(()) => return Ok(pid),
+                Err(reason) => {
+                    diagnostics.push(ProcessDiagnostic {
+                        pid,
+                        name: name.clone(),
+                        reason,
                     });
                 }
             }
@@ -182,16 +185,8 @@ impl TrustedInstallerStrategy {
                 continue;
             }
 
-            match Token::from_pid(pid) {
-                Ok(token) => {
-                    if is_viable_system_token(&token, Some(0)) {
-                        return Ok(pid);
-                    }
-                    // Deliberate design decision:
-                    // In Stage 2, processes that are accessible but lack SYSTEM privileges (e.g.
-                    // network services or non-admin worker tokens) are expected and therefore
-                    // skipped without recording to avoid polluting the diagnostic report.
-                }
+            let token = match Token::from_pid(pid) {
+                Ok(token) => token,
                 Err(e) => {
                     // Security blocks (e.g. AccessDenied from PPL/EDR) are recorded for troubleshooting.
                     diagnostics.push(ProcessDiagnostic {
@@ -199,7 +194,20 @@ impl TrustedInstallerStrategy {
                         name: name.clone(),
                         reason: e.to_access_failure(),
                     });
+                    continue;
                 }
+            };
+
+            match verify_system_token(&token, Some(0)) {
+                Ok(()) => return Ok(pid),
+                Err(reason) if !matches!(reason, ProcessAccessFailure::NotSystemSid { .. }) => {
+                    diagnostics.push(ProcessDiagnostic {
+                        pid,
+                        name: name.clone(),
+                        reason,
+                    });
+                }
+                _ => {}
             }
         }
 
@@ -210,7 +218,6 @@ impl TrustedInstallerStrategy {
 impl ElevationStrategy for TrustedInstallerStrategy {
     fn acquire_primary_token(&self) -> Result<Token, ElevateError> {
         let current_token = Token::current()?;
-
         // Fast-fail before attempting SCM or system process operations
         if !current_token.is_elevated_admin()? {
             return Err(ElevateError::AdministratorRequired);
@@ -376,28 +383,40 @@ fn is_system32_binary(pid: u32, system32: &Path) -> bool {
 }
 
 /// Verifies whether an opened Token has full, unrestricted SYSTEM capabilities.
-fn is_viable_system_token(token: &Token, target_session: Option<u32>) -> bool {
-    let is_system = token.user_sid().is_ok_and(|sid| sid == LOCAL_SYSTEM_SID);
-    if !is_system {
-        return false;
+fn verify_system_token(
+    token: &Token,
+    target_session: Option<u32>,
+) -> Result<(), ProcessAccessFailure> {
+    let sid = token.user_sid().map_err(|e| e.to_access_failure())?;
+    if sid != LOCAL_SYSTEM_SID {
+        return Err(ProcessAccessFailure::NotSystemSid { sid });
     }
 
-    if target_session.is_some_and(|expected| !token.session_id().is_ok_and(|s| s == expected)) {
-        return false;
+    if let Some(expected) = target_session {
+        let actual = token.session_id().map_err(|e| e.to_access_failure())?;
+        if actual != expected {
+            return Err(ProcessAccessFailure::SessionMismatch { expected, actual });
+        }
     }
 
-    if token.is_restricted().unwrap_or(true) {
-        return false;
+    if token.is_restricted().map_err(|e| e.to_access_failure())? {
+        return Err(ProcessAccessFailure::RestrictedToken);
     }
 
-    let is_system_il = token
-        .integrity_level()
-        .is_ok_and(|il| il >= SECURITY_MANDATORY_SYSTEM_RID as u32);
-    if !is_system_il {
-        return false;
+    let level = token.integrity_level().map_err(|e| e.to_access_failure())?;
+    let expected = SECURITY_MANDATORY_SYSTEM_RID as u32;
+    if level < expected {
+        return Err(ProcessAccessFailure::LowIntegrityLevel { level, expected });
     }
 
-    token
+    let has_impersonate = token
         .has_privilege_present(Privilege::Impersonate)
-        .unwrap_or(false)
+        .map_err(|e| e.to_access_failure())?;
+    if !has_impersonate {
+        return Err(ProcessAccessFailure::MissingPrivilege {
+            privilege: Privilege::Impersonate.as_str(),
+        });
+    }
+
+    Ok(())
 }

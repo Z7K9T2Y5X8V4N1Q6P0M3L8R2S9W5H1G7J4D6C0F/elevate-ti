@@ -18,6 +18,44 @@ pub enum ProcessAccessFailure {
     #[error("Token accessible, but lacks SYSTEM rights or privileges")]
     InsufficientPrivileges,
 
+    /// The process token is owned by a SID other than Local System (`S-1-5-18`).
+    #[error("Token user SID '{sid}' is not Local System (S-1-5-18)")]
+    NotSystemSid {
+        /// The actual user SID string present on the token.
+        sid: String,
+    },
+
+    /// The process token resides in a different Windows Session than expected.
+    #[error("Token session ID mismatch: expected Session {expected}, found Session {actual}")]
+    SessionMismatch {
+        /// The expected session ID (typically Session 0).
+        expected: u32,
+        /// The actual session ID assigned to the inspected token.
+        actual: u32,
+    },
+
+    /// The token is a restricted/filtered token and cannot be used for elevation.
+    #[error("Token is restricted (filtered token)")]
+    RestrictedToken,
+
+    /// The token integrity level is lower than the mandatory SYSTEM integrity level.
+    #[error(
+        "Token integrity level (0x{level:04X}) is below SYSTEM mandatory level (0x{expected:04X})"
+    )]
+    LowIntegrityLevel {
+        /// The actual integrity level RID read from the token.
+        level: u32,
+        /// The expected mandatory SYSTEM integrity level RID.
+        expected: u32,
+    },
+
+    /// The token does not hold a required administrative privilege.
+    #[error("Token lacks required privilege: {privilege}")]
+    MissingPrivilege {
+        /// Constant name of the missing privilege (e.g. `SeImpersonatePrivilege`).
+        privilege: &'static str,
+    },
+
     /// Explicit kernel-level access denial (0x80070005), typically caused by PPL, VBS, or EDR/AV drivers.
     #[error("Access denied [0x{hresult:08X}: {message}] (PPL/VBS/EDR intervention)")]
     AccessDenied {
