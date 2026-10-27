@@ -1,8 +1,7 @@
 //! Pluggable privilege elevation strategies.
 
-pub mod winlogon_ti;
-
-pub use winlogon_ti::{SessionTarget, TrustedInstallerStrategy};
+pub mod token_duplication;
+pub use token_duplication::{SessionTarget, TrustedInstallerStrategy};
 
 use crate::{error::ElevateError, security::Token};
 
