@@ -19,15 +19,21 @@
 ## Architecture Flow
 
 ```text
-Caller (Admin)
+Caller (Admin with SeDebugPrivilege)
   │
-  ├─> 1. Enable SeDebugPrivilege & SeImpersonatePrivilege
-  ├─> 2. Ensure TrustedInstaller service is running (SCM)
-  ├─> 3. Impersonate SYSTEM (via winlogon.exe or Session 0 SYSTEM process)
-  │     └─> Duplicate TrustedInstaller Primary Token
-  │     └─> Optionally bind Token to target Session ID (Caller/Interactive/None)
+  ├─> 1. Ensure "TrustedInstaller" Service is Running (SCM polling)
   │
-  └─> 4. Spawn target process (Interactive Desktop or Headless)
+  ├─> 2. Pivot to Session 0 SYSTEM Token (Bypassing RunAs-PPL/WinTCB)
+  │     ├─> Primary: services.exe (System32 path validated)
+  │     └─> Fallback: Dynamic Session 0 scan & token verification
+  │
+  ├─> 3. Impersonate SYSTEM (Acquires SeTcbPrivilege)
+  │     │
+  │     └─> Duplicate TrustedInstaller Token (TokenPrimary)
+  │           ├─> Headless: Bind strictly to Session 0 (No desktop station)
+  │           └─> Interactive: Reassign TokenSessionId + Readback Verification
+  │
+  └─> 4. CreateProcessWithTokenW (Target Desktop or Headless Context)
 ```
 
 ## Quickstart
