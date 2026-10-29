@@ -122,9 +122,7 @@ impl TrustedInstallerStrategy {
 
     /// Resolves an accessible, unrestricted SYSTEM process in Session 0 via a two-stage scan.
     fn resolve_system_process(&self) -> Result<u32, ElevateError> {
-        let system32 = get_system32_directory().ok_or_else(|| {
-            ElevateError::ProcessNotFound("system32 directory unresolvable".to_string())
-        })?;
+        let system32 = get_system32_directory()?;
 
         // Snapshot is collected into an owned vector to allow multiple iterations
         // without consuming or attempting to clone non-cloneable Win32 handles.
@@ -140,7 +138,19 @@ impl TrustedInstallerStrategy {
 
             checked_pids.insert(pid);
 
-            if !is_system32_binary(pid, &system32) {
+            let exe_path = match get_process_image_path(pid) {
+                Ok(path) => path,
+                Err(e) => {
+                    diagnostics.push(ProcessDiagnostic {
+                        pid,
+                        name: name.clone(),
+                        reason: e.to_access_failure(),
+                    });
+                    continue;
+                }
+            };
+
+            if !is_in_system32(&exe_path, &system32) {
                 diagnostics.push(ProcessDiagnostic {
                     pid,
                     name: name.clone(),
@@ -181,7 +191,20 @@ impl TrustedInstallerStrategy {
             }
 
             // Both stages enforce system32 physical path validation for defense-in-depth
-            if !is_system32_binary(pid, &system32) {
+            let exe_path = match get_process_image_path(pid) {
+                Ok(path) => path,
+                Err(e) => {
+                    // Security blocks (e.g. AccessDenied from PPL/EDR) are recorded for troubleshooting.
+                    diagnostics.push(ProcessDiagnostic {
+                        pid,
+                        name: name.clone(),
+                        reason: e.to_access_failure(),
+                    });
+                    continue;
+                }
+            };
+
+            if !is_in_system32(&exe_path, &system32) {
                 continue;
             }
 
@@ -200,14 +223,15 @@ impl TrustedInstallerStrategy {
 
             match verify_system_token(&token, Some(0)) {
                 Ok(()) => return Ok(pid),
-                Err(reason) if !matches!(reason, ProcessAccessFailure::NotSystemSid { .. }) => {
+
+                Err(ProcessAccessFailure::NotSystemSid { .. }) => {}
+                Err(reason) => {
                     diagnostics.push(ProcessDiagnostic {
                         pid,
                         name: name.clone(),
                         reason,
                     });
                 }
-                _ => {}
             }
         }
 
@@ -341,40 +365,41 @@ fn has_logged_on_user(session_id: u32) -> bool {
 }
 
 /// Retrieve the canonical System32 directory (e.g. `C:\Windows\System32`).
-fn get_system32_directory() -> Option<PathBuf> {
+fn get_system32_directory() -> Result<PathBuf, ElevateError> {
     let mut buf = [0u16; MAX_PATH as usize];
     let len = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
     if len == 0 || len > buf.len() {
-        return None;
+        return Err(ElevateError::SystemDirectoryNotFound);
     }
-    Some(PathBuf::from(String::from_utf16_lossy(&buf[..len])))
+    Ok(PathBuf::from(String::from_utf16_lossy(&buf[..len])))
 }
 
-/// Verifies whether the executable backing a process is physically located in the System32 folder.
-fn is_system32_binary(pid: u32, system32: &Path) -> bool {
-    let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
-    else {
-        return false;
-    };
+/// Query the full executable image path backing an active process.
+fn get_process_image_path(pid: u32) -> Result<PathBuf, ElevateError> {
+    let process = win32!(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid))?;
     let _guard = HandleGuard(process);
 
     let mut buf = [0u16; 1024];
     let mut size = buf.len() as u32;
 
-    let res = unsafe {
-        QueryFullProcessImageNameW(
-            process,
-            PROCESS_NAME_FORMAT(0),
-            PWSTR(buf.as_mut_ptr()),
-            &raw mut size,
-        )
-    };
+    win32!(QueryFullProcessImageNameW(
+        process,
+        PROCESS_NAME_FORMAT(0),
+        PWSTR(buf.as_mut_ptr()),
+        &raw mut size,
+    ))?;
 
-    if res.is_err() || size == 0 {
-        return false;
+    if size == 0 {
+        return Err(ElevateError::InvalidTokenBuffer);
     }
 
-    let exe_path = PathBuf::from(String::from_utf16_lossy(&buf[..size as usize]));
+    Ok(PathBuf::from(String::from_utf16_lossy(
+        &buf[..size as usize],
+    )))
+}
+
+/// Pure path verification: checks whether a binary is physically located in the System32 folder.
+fn is_in_system32(exe_path: &Path, system32: &Path) -> bool {
     exe_path
         .parent()
         .and_then(|p| p.to_str())
@@ -435,37 +460,70 @@ mod tests {
     }
 
     #[test]
-    fn get_system32_directory_returns_some() {
-        let dir = get_system32_directory();
-        assert!(dir.is_some(), "System32 directory must be resolvable");
-        let path = dir.unwrap();
-        let lower = path.to_string_lossy().to_lowercase();
+    fn get_system32_directory_succeeds() {
+        let path = get_system32_directory().expect("System32 directory must be resolvable");
+        let path = path.to_string_lossy().to_lowercase();
         assert!(
-            lower.contains("system32"),
-            "Path must contain 'system32', got: {lower}"
+            path.contains("system32"),
+            "Path must contain 'system32', got: {path}"
         );
     }
 
     #[test]
-    fn is_system32_binary_invalid_pid_returns_false() {
-        let system32 = get_system32_directory().unwrap();
-        assert!(!is_system32_binary(0, &system32));
+    fn get_process_image_path_invalid_pids_fail_with_win32_error() {
+        match get_process_image_path(0) {
+            Err(ElevateError::Win32 { operation, .. }) => {
+                assert_eq!(operation, "OpenProcess");
+            }
+            other => panic!("Expected Win32 OpenProcess error for PID 0, got: {other:?}"),
+        }
+
+        match get_process_image_path(u32::MAX - 1) {
+            Err(ElevateError::Win32 { operation, .. }) => {
+                assert_eq!(operation, "OpenProcess");
+            }
+            other => panic!("Expected Win32 OpenProcess error for bogus PID, got: {other:?}"),
+        }
     }
 
     #[test]
-    fn is_system32_binary_bogus_pid_returns_false() {
-        let system32 = get_system32_directory().unwrap();
-        assert!(!is_system32_binary(u32::MAX - 1, &system32));
-    }
-
-    #[test]
-    fn is_system32_binary_current_process() {
+    fn current_process_image_path_resolves_and_not_in_system32() {
         let system32 = get_system32_directory().unwrap();
         let current_pid = std::process::id();
+
+        let path = get_process_image_path(current_pid)
+            .expect("Should be able to query current process image path");
+
         assert!(
-            !is_system32_binary(current_pid, &system32),
-            "The test binary should not appear to be in System32"
+            !is_in_system32(&path, &system32),
+            "The test binary ({path:?}) should not appear to be in System32"
         );
+    }
+
+    #[test]
+    fn is_in_system32_path_matching() {
+        let system32 = Path::new(r"C:\Windows\System32");
+
+        assert!(is_in_system32(
+            Path::new(r"C:\Windows\System32\services.exe"),
+            system32
+        ));
+        assert!(is_in_system32(
+            Path::new(r"c:\windows\system32\svchost.exe"),
+            system32
+        ));
+        assert!(!is_in_system32(
+            Path::new(r"C:\Windows\System32\drivers\etc"),
+            system32
+        ));
+        assert!(!is_in_system32(
+            Path::new(r"C:\Windows\explorer.exe"),
+            system32
+        ));
+        assert!(!is_in_system32(
+            Path::new(r"D:\Tools\fake_services.exe"),
+            system32
+        ));
     }
 
     #[test]
@@ -488,10 +546,14 @@ mod tests {
     fn verify_system_token_with_session_mismatch() {
         let token = Token::current().unwrap();
         let result = verify_system_token(&token, Some(99));
-        assert!(
-            result.is_err(),
-            "Non-SYSTEM token with session 99 target must fail"
-        );
+        match result {
+            Err(ProcessAccessFailure::SessionMismatch { expected, actual }) => {
+                assert_eq!(expected, 99);
+                assert_ne!(actual, 99);
+            }
+            Err(ProcessAccessFailure::NotSystemSid { .. }) => {}
+            other => panic!("Expected SessionMismatch or NotSystemSid, got: {other:?}"),
+        }
     }
 
     #[test]

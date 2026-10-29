@@ -123,9 +123,9 @@ pub enum ElevateError {
         privilege: &'static str,
     },
 
-    /// A required genuine Windows SYSTEM process was not found.
-    #[error("Required system process '{0}' was not found in active session")]
-    ProcessNotFound(String),
+    /// Failed to resolve the canonical Windows System32 directory path.
+    #[error("Failed to resolve canonical System32 directory")]
+    SystemDirectoryNotFound,
 
     /// A Windows service failed to start or entered a failed state.
     #[error(
