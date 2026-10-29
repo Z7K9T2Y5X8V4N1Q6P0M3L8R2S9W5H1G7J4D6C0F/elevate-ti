@@ -41,7 +41,7 @@ pub enum InteractiveDesktop {
     /// The screensaver desktop (`WinSta0\Screen-Saver`).
     Screensaver,
 
-    /// A custom Window Station and Desktop object path (e.g. "`MyStation\\MyDesktop`").
+    /// A custom Window Station and Desktop object path (e.g. `CustomStation\\CustomDesktop`).
     Custom(String),
 }
 
@@ -51,7 +51,7 @@ impl InteractiveDesktop {
         Self::Custom(station_and_desktop.into())
     }
 
-    pub(crate) fn as_station_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         match self {
             Self::Default => "WinSta0\\Default",
             Self::Winlogon => "WinSta0\\Winlogon",
@@ -102,7 +102,7 @@ pub struct TokenCommand {
 impl TokenCommand {
     /// Create a new command builder bound to an elevated token and its target desktop context.
     pub fn new(token: Token, desktop: Option<InteractiveDesktop>) -> Self {
-        let desktop_str = desktop.map(|d| HSTRING::from(d.as_station_str()));
+        let desktop_str = desktop.map(|d| HSTRING::from(d.as_str()));
         Self {
             token,
             exe: None,
@@ -207,4 +207,77 @@ fn expand_env_path(path: &Path) -> PathBuf {
 
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     PathBuf::from(OsString::from_wide(&buf[..len]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_default_station_str() {
+        assert_eq!(InteractiveDesktop::Default.as_str(), "WinSta0\\Default");
+    }
+
+    #[test]
+    fn desktop_winlogon_station_str() {
+        assert_eq!(InteractiveDesktop::Winlogon.as_str(), "WinSta0\\Winlogon");
+    }
+
+    #[test]
+    fn desktop_screensaver_station_str() {
+        assert_eq!(
+            InteractiveDesktop::Screensaver.as_str(),
+            "WinSta0\\Screen-Saver"
+        );
+    }
+
+    #[test]
+    fn desktop_custom_station_str() {
+        assert_eq!(
+            InteractiveDesktop::custom("CustomStation\\CustomDesktop").as_str(),
+            "CustomStation\\CustomDesktop"
+        );
+    }
+
+    #[test]
+    fn desktop_custom_empty_string() {
+        assert_eq!(InteractiveDesktop::custom("").as_str(), "");
+    }
+
+    #[test]
+    fn execution_context_default_is_interactive_default() {
+        assert_eq!(
+            ExecutionContext::default(),
+            ExecutionContext::Interactive(InteractiveDesktop::Default)
+        );
+    }
+
+    #[test]
+    fn expand_env_path_without_variables_returns_unchanged() {
+        let cases = [
+            "C:\\Windows\\System32\\cmd.exe",
+            "relative\\path\\to\\file.txt",
+            "plain_filename.exe",
+        ];
+
+        for case in cases {
+            let input = Path::new(case);
+            assert_eq!(expand_env_path(input), input, "Failed on: {case}");
+        }
+    }
+
+    #[test]
+    fn expand_env_path_with_systemroot() {
+        let input = Path::new("%SystemRoot%\\System32\\cmd.exe");
+        let result = expand_env_path(input);
+        let result_str = result.to_string_lossy();
+        assert!(
+            !result_str.contains('%'),
+            "Environment variable should have been expanded, got: {result_str}"
+        );
+        assert!(
+            result_str.ends_with("\\System32\\cmd.exe"),
+            "Suffix must be preserved, got: {result_str}"
+        );
+    }
 }

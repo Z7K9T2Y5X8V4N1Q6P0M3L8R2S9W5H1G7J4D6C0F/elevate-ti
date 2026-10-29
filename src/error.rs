@@ -189,10 +189,10 @@ pub enum ElevateError {
 
     /// All candidate SYSTEM processes in Session 0 could not be accessed.
     #[error(
-            "Failed to acquire a viable SYSTEM token. Inspected {} candidate(s):{}",
-            diagnostics.len(),
-            format_diagnostics(diagnostics)
-        )]
+        "Failed to acquire a viable SYSTEM token. Inspected {} candidate(s):{}",
+        diagnostics.len(),
+        format_diagnostics(diagnostics)
+    )]
     NoViableSystemProcess {
         /// Full diagnostic log detailing why each inspected candidate was rejected.
         diagnostics: Vec<ProcessDiagnostic>,
@@ -221,7 +221,7 @@ impl ElevateError {
                 let hresult = source.code().0 as u32;
                 let message = format!("{source}");
 
-                if source.code() == E_ACCESSDENIED {
+                if hresult == E_ACCESSDENIED.0 as u32 {
                     ProcessAccessFailure::AccessDenied { hresult, message }
                 } else {
                     ProcessAccessFailure::Win32Error { hresult, message }
@@ -230,6 +230,63 @@ impl ElevateError {
             other => ProcessAccessFailure::InternalError {
                 message: other.to_string(),
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::E_INVALIDARG;
+
+    #[test]
+    fn to_access_failure_converts_access_denied() {
+        let err = ElevateError::Win32 {
+            operation: "OpenProcessToken",
+            source: windows::core::Error::from_hresult(E_ACCESSDENIED),
+        };
+        match err.to_access_failure() {
+            ProcessAccessFailure::AccessDenied { hresult, .. } => {
+                assert_eq!(hresult, E_ACCESSDENIED.0 as u32);
+            }
+            other => panic!("Expected AccessDenied, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_access_failure_converts_generic_win32_error() {
+        let code = windows::core::HRESULT(E_INVALIDARG.0);
+        let err = ElevateError::Win32 {
+            operation: "SomeCall",
+            source: windows::core::Error::from_hresult(code),
+        };
+        match err.to_access_failure() {
+            ProcessAccessFailure::Win32Error { hresult, .. } => {
+                assert_eq!(hresult, E_INVALIDARG.0 as u32);
+            }
+            other => panic!("Expected Win32Error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_access_failure_converts_internal_elevate_error() {
+        let err = ElevateError::AdministratorRequired;
+        match err.to_access_failure() {
+            ProcessAccessFailure::InternalError { message } => {
+                assert!(message.contains("Administrator"));
+            }
+            other => panic!("Expected InternalError, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_access_failure_converts_io_error() {
+        let err = ElevateError::Io(io::Error::new(io::ErrorKind::NotFound, "file not found"));
+        match err.to_access_failure() {
+            ProcessAccessFailure::InternalError { message } => {
+                assert!(message.contains("file not found"));
+            }
+            other => panic!("Expected InternalError, got: {other:?}"),
         }
     }
 }

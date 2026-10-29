@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // you can use `elevated_command_on`:
     //
     // elevated_command_on(InteractiveDesktop::Winlogon)?.exe(...).spawn()?;
-    // elevated_command_on(InteractiveDesktop::custom("MyStation\\MyDesktop"))?.exe(...).spawn()?;
+    // elevated_command_on(InteractiveDesktop::custom("CustomStation\\CustomDesktop"))?.exe(...).spawn()?;
 
     println!("Elevated Command Prompt spawned successfully.");
     Ok(())

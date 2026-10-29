@@ -420,3 +420,90 @@ fn verify_system_token(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::InteractiveDesktop;
+
+    #[test]
+    fn strategy_default_context_is_interactive_default() {
+        assert_eq!(
+            *TrustedInstallerStrategy::default().context(),
+            ExecutionContext::Interactive(InteractiveDesktop::Default)
+        );
+    }
+
+    #[test]
+    fn get_system32_directory_returns_some() {
+        let dir = get_system32_directory();
+        assert!(dir.is_some(), "System32 directory must be resolvable");
+        let path = dir.unwrap();
+        let lower = path.to_string_lossy().to_lowercase();
+        assert!(
+            lower.contains("system32"),
+            "Path must contain 'system32', got: {lower}"
+        );
+    }
+
+    #[test]
+    fn is_system32_binary_invalid_pid_returns_false() {
+        let system32 = get_system32_directory().unwrap();
+        assert!(!is_system32_binary(0, &system32));
+    }
+
+    #[test]
+    fn is_system32_binary_bogus_pid_returns_false() {
+        let system32 = get_system32_directory().unwrap();
+        assert!(!is_system32_binary(u32::MAX - 1, &system32));
+    }
+
+    #[test]
+    fn is_system32_binary_current_process() {
+        let system32 = get_system32_directory().unwrap();
+        let current_pid = std::process::id();
+        assert!(
+            !is_system32_binary(current_pid, &system32),
+            "The test binary should not appear to be in System32"
+        );
+    }
+
+    #[test]
+    fn verify_system_token_rejects_non_system_token() {
+        let token = Token::current().unwrap();
+        let result = verify_system_token(&token, None);
+        match result {
+            Err(ProcessAccessFailure::NotSystemSid { sid }) => {
+                assert!(sid.starts_with("S-1-"), "Rejected SID must be valid: {sid}");
+                assert_ne!(sid, LOCAL_SYSTEM_SID);
+            }
+            Ok(()) => {}
+            Err(other) => {
+                panic!("Expected NotSystemSid or Ok, got: {other:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn verify_system_token_with_session_mismatch() {
+        let token = Token::current().unwrap();
+        let result = verify_system_token(&token, Some(99));
+        assert!(
+            result.is_err(),
+            "Non-SYSTEM token with session 99 target must fail"
+        );
+    }
+
+    #[test]
+    fn test_caller_session_matches_current_env() {
+        let token = Token::current().unwrap();
+        let session = token.session_id().unwrap();
+
+        let result = resolve_session(&token, &SessionTarget::CallerSession);
+        match result {
+            Ok(s) => assert_eq!(s, session),
+            Err(ElevateError::SessionZeroNotSupported) => assert_eq!(session, 0),
+            Err(e) => panic!("Unexpected error: {e}"),
+        }
+    }
+}
