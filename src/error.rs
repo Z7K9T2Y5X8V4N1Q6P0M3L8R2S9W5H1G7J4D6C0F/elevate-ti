@@ -1,6 +1,6 @@
 //! Domain error types for `TrustedInstaller` elevation operations.
 
-use std::io;
+use std::{fmt::Display, io};
 use thiserror::Error;
 use windows::Win32::Foundation::E_ACCESSDENIED;
 
@@ -94,6 +94,16 @@ pub struct ProcessDiagnostic {
     pub reason: ProcessAccessFailure,
 }
 
+/// Diagnostic item for an individual Windows session inspected during interactive session discovery.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("Session {session_id}: {reason}")]
+pub struct SessionDiagnostic {
+    /// Windows Session ID.
+    pub session_id: u32,
+    /// Concrete reason why the session could not be queried or utilized.
+    pub reason: ProcessAccessFailure,
+}
+
 /// The central error type for all privilege elevation and Windows security operations.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -160,10 +170,6 @@ pub enum ElevateError {
     )]
     SessionZeroNotSupported,
 
-    /// No interactive session with a logged-on user was found.
-    #[error("No interactive desktop session available on this machine")]
-    NoInteractiveSession,
-
     /// An I/O error occurred during path resolution or execution.
     #[error("I/O query failed: {0}")]
     Io(#[from] io::Error),
@@ -197,9 +203,21 @@ pub enum ElevateError {
         /// Full diagnostic log detailing why each inspected candidate was rejected.
         diagnostics: Vec<ProcessDiagnostic>,
     },
+
+    /// No interactive session with a logged-on user was found.
+    #[error(
+            "No interactive desktop session available on this machine. Inspected {} session(s):{}",
+            diagnostics.len(),
+            format_diagnostics(diagnostics)
+        )]
+    NoInteractiveSession {
+        /// Full diagnostic log detailing why candidate sessions were rejected.
+        diagnostics: Vec<SessionDiagnostic>,
+    },
 }
 
-fn format_diagnostics(diagnostics: &[ProcessDiagnostic]) -> String {
+/// Formats a list of diagnostic items into an indented bulleted log block.
+fn format_diagnostics<T: Display>(diagnostics: &[T]) -> String {
     if diagnostics.is_empty() {
         return String::new();
     }

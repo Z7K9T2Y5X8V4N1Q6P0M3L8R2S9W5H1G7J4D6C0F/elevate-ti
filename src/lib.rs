@@ -5,7 +5,7 @@ pub mod security;
 pub mod session;
 pub mod strategy;
 
-pub use error::{ElevateError, ProcessAccessFailure, ProcessDiagnostic};
+pub use error::{ElevateError, ProcessAccessFailure, ProcessDiagnostic, SessionDiagnostic};
 pub use security::{
     ExecutionContext, InteractiveDesktop, Privilege, Sid, Token, TokenCommand, TokenType,
 };

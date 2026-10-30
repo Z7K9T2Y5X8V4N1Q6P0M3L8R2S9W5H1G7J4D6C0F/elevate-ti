@@ -29,6 +29,7 @@ use windows::{
 };
 
 use crate::{
+    SessionDiagnostic,
     error::{ElevateError, ProcessAccessFailure, ProcessDiagnostic},
     security::{
         ExecutionContext, HandleGuard, Privilege, ProcessSnapshot, ServiceManager, Token,
@@ -304,10 +305,17 @@ fn resolve_session(caller_token: &Token, target: &SessionTarget) -> Result<u32, 
     }
 }
 
+/// Resolves an active, user-authenticated Windows session for interactive UI delegation.
+///
+/// Implements a prioritized two-tier session election algorithm:
+/// 1. **Primary Target**: The physical console session (`WTSGetActiveConsoleSessionId`)
+///    directly connected to local video/input peripherals.
+/// 2. **Fallback Target**: The first active authenticated remote desktop (RDP) session.
 fn find_any_interactive_session() -> Result<u32, ElevateError> {
     let mut p_info: *mut WTS_SESSION_INFOW = std::ptr::null_mut();
     let mut count = 0u32;
 
+    // Enumerate all active and inactive terminal sessions in the local subsystem.
     win32!(WTSEnumerateSessionsW(
         WTS_CURRENT_SERVER_HANDLE,
         0,
@@ -318,50 +326,100 @@ fn find_any_interactive_session() -> Result<u32, ElevateError> {
 
     let _session_list_guard = WtsMemoryGuard(p_info.cast());
 
+    // Defensive boundary check: In modern Windows, Session 0 is universally guaranteed to exist.
+    // If the API returns a null pointer or 0 count despite succeeding, the Terminal Services buffer
+    // is corrupted or intercepted by faulty third-party API hooks/EDR drivers.
     if p_info.is_null() || count == 0 {
-        return Err(ElevateError::NoInteractiveSession);
+        return Err(ElevateError::InvalidTokenBuffer);
     }
 
     let sessions = unsafe { slice::from_raw_parts(p_info, count as usize) };
     let console_session_id = unsafe { WTSGetActiveConsoleSessionId() };
 
     let mut candidate: Option<u32> = None;
+    let mut diagnostics = Vec::new();
 
     for s in sessions {
-        if s.State != WTSActive || !has_logged_on_user(s.SessionId) {
+        // Filter out disconnected (WTSDisconnected), paused, or terminating sessions.
+        // `WTSActive` guarantees the session's display and input channels are actively engaged.
+        if s.State != WTSActive {
             continue;
         }
 
-        if s.SessionId == console_session_id {
-            return Ok(s.SessionId);
-        }
+        // Validate that an authenticated, human user is actually logged into this session.
+        // A session in `WTSActive` state may still just be resting at the Windows Logon/Lock screen (LogonUI).
+        match has_logged_on_user(s.SessionId) {
+            Ok(true) => {
+                // Priority 1: Physical Console match.
+                // The user is sitting directly in front of the machine's primary display and peripherals.
+                // Short-circuit immediately to avoid spawning onto an incidental background RDP session.
+                if s.SessionId == console_session_id {
+                    return Ok(s.SessionId);
+                }
 
-        if candidate.is_none() {
-            candidate = Some(s.SessionId);
+                // Priority 2: Remote / RDP session fallback.
+                // First-fit arbitration: preserve the first discovered authenticated remote user session,
+                // while continuing the scan in case the physical console session appears later.
+                if candidate.is_none() {
+                    candidate = Some(s.SessionId);
+                }
+            }
+            Ok(false) => {
+                // The session is physically or remotely connected (Active), but has no bound user identity
+                // (e.g. at the login credential prompt, or a headless display dummy/emulator).
+                diagnostics.push(SessionDiagnostic {
+                    session_id: s.SessionId,
+                    reason: ProcessAccessFailure::InternalError {
+                        message:
+                            "Active session has an empty or unassigned username (e.g. lock screen)"
+                                .to_string(),
+                    },
+                });
+            }
+            Err(e) => {
+                // Record API-level access denial or system errors (e.g. 0x80070005 ACCESS_DENIED)
+                // for structured diagnostics instead of silently ignoring the underlying root cause.
+                diagnostics.push(SessionDiagnostic {
+                    session_id: s.SessionId,
+                    reason: e.to_access_failure(),
+                });
+            }
         }
     }
 
-    candidate.ok_or(ElevateError::NoInteractiveSession)
+    // Unpack candidate: returns `Ok(session_id)` if an RDP fallback candidate was located.
+    // If all candidates were rejected or inaccessible, converts `None` into a detailed error
+    // containing the post-mortem diagnostics log of every rejected session.
+    candidate.ok_or(ElevateError::NoInteractiveSession { diagnostics })
 }
 
-fn has_logged_on_user(session_id: u32) -> bool {
+/// Query whether a specific Windows Session currently has an authenticated user logged on.
+///
+/// Returns `Ok(true)` only if a non-empty username string is bound to the target session.
+fn has_logged_on_user(session_id: u32) -> Result<bool, ElevateError> {
     let mut raw_ptr = PWSTR::null();
     let mut bytes = 0u32;
 
-    let res = win32!(WTSQuerySessionInformationW(
+    win32!(WTSQuerySessionInformationW(
         WTS_CURRENT_SERVER_HANDLE,
         session_id,
         WTSUserName,
         &raw mut raw_ptr,
         &raw mut bytes,
-    ));
+    ))?;
 
-    if res.is_err() || raw_ptr.is_null() {
-        return false;
+    if raw_ptr.is_null() {
+        return Err(ElevateError::InvalidTokenBuffer);
     }
 
     let _username_buf_guard = WtsMemoryGuard(raw_ptr.0.cast());
-    unsafe { *raw_ptr.0 != 0 }
+
+    // SAFETY: Terminal Services guarantees a valid null-terminated UTF-16 wide string buffer on success.
+    // In C-style wide strings, an empty username (`""`) begins immediately with the null terminator `\0` (0x0000).
+    // Inspecting the 0th `u16` character is an O(1) non-allocating check:
+    // - `*raw_ptr.0 == 0`: Empty string (unauthenticated session / login screen).
+    // - `*raw_ptr.0 != 0`: Non-empty string (authenticated user actively logged on).
+    Ok(unsafe { *raw_ptr.0 != 0 })
 }
 
 /// Retrieve the canonical System32 directory (e.g. `C:\Windows\System32`).
