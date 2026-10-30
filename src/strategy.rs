@@ -3,7 +3,7 @@
 pub mod token_duplication;
 pub use token_duplication::{SessionTarget, TrustedInstallerStrategy};
 
-use crate::{error::ElevateError, security::Token};
+use crate::{error::ElevateError, security::token::Token};
 
 /// Contract for privilege elevation mechanisms.
 pub trait ElevationStrategy {

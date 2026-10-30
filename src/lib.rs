@@ -6,10 +6,6 @@ pub mod session;
 pub mod strategy;
 
 pub use error::{ElevateError, ProcessAccessFailure, ProcessDiagnostic, SessionDiagnostic};
-pub use security::{
-    ExecutionContext, InteractiveDesktop, Privilege, Sid, Token, TokenCommand, TokenType,
-};
-pub use session::{
-    ElevationStatus, elevated_command, elevated_command_on, headless_command, relaunch, status,
-};
+pub use security::{Command, ExecutionContext, InteractiveDesktop};
+pub use session::{ElevationStatus, relaunch, status};
 pub use strategy::{ElevationStrategy, SessionTarget, TrustedInstallerStrategy};

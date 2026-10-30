@@ -32,8 +32,10 @@ use crate::{
     SessionDiagnostic,
     error::{ElevateError, ProcessAccessFailure, ProcessDiagnostic},
     security::{
-        ExecutionContext, HandleGuard, Privilege, ProcessSnapshot, ServiceManager, Token,
-        TokenType, win32,
+        ExecutionContext, HandleGuard, ProcessSnapshot, ServiceManager,
+        privilege::Privilege,
+        token::{Token, TokenType},
+        win32,
     },
     strategy::ElevationStrategy,
 };
@@ -123,7 +125,7 @@ impl TrustedInstallerStrategy {
 
     /// Resolves an accessible, unrestricted SYSTEM process in Session 0 via a two-stage scan.
     fn resolve_system_process(&self) -> Result<u32, ElevateError> {
-        let system32 = get_system32_directory()?;
+        let system32_path = get_system32_path()?;
 
         // Snapshot is collected into an owned vector to allow multiple iterations
         // without consuming or attempting to clone non-cloneable Win32 handles.
@@ -151,7 +153,7 @@ impl TrustedInstallerStrategy {
                 }
             };
 
-            if !is_in_system32(&exe_path, &system32) {
+            if !is_in_system32(&exe_path, &system32_path) {
                 diagnostics.push(ProcessDiagnostic {
                     pid,
                     name: name.clone(),
@@ -205,7 +207,7 @@ impl TrustedInstallerStrategy {
                 }
             };
 
-            if !is_in_system32(&exe_path, &system32) {
+            if !is_in_system32(&exe_path, &system32_path) {
                 continue;
             }
 
@@ -423,7 +425,7 @@ fn has_logged_on_user(session_id: u32) -> Result<bool, ElevateError> {
 }
 
 /// Retrieve the canonical System32 directory (e.g. `C:\Windows\System32`).
-fn get_system32_directory() -> Result<PathBuf, ElevateError> {
+fn get_system32_path() -> Result<PathBuf, ElevateError> {
     let mut buf = [0u16; MAX_PATH as usize];
     let len = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
     if len == 0 || len > buf.len() {
@@ -519,7 +521,7 @@ mod tests {
 
     #[test]
     fn get_system32_directory_succeeds() {
-        let path = get_system32_directory().expect("System32 directory must be resolvable");
+        let path = get_system32_path().expect("System32 directory must be resolvable");
         let path = path.to_string_lossy().to_lowercase();
         assert!(
             path.contains("system32"),
@@ -546,7 +548,7 @@ mod tests {
 
     #[test]
     fn current_process_image_path_resolves_and_not_in_system32() {
-        let system32 = get_system32_directory().unwrap();
+        let system32 = get_system32_path().unwrap();
         let current_pid = std::process::id();
 
         let path = get_process_image_path(current_pid)
@@ -625,5 +627,99 @@ mod tests {
             Err(ElevateError::SessionZeroNotSupported) => assert_eq!(session, 0),
             Err(e) => panic!("Unexpected error: {e}"),
         }
+    }
+
+    // =======================================================================
+    // Elevated tests — require Administrator + SeDebugPrivilege + SCM access
+    // =======================================================================
+
+    const TRUSTED_INSTALLER_SID: windows::core::PCWSTR =
+        w!("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464");
+
+    fn assert_elevated_context() {
+        let token = Token::current().expect("Failed to open current process security token");
+
+        assert!(
+            token.is_elevated_admin().unwrap_or(false),
+            "Test execution requires an elevated Administrator context. \
+             Please run from an Administrator prompt."
+        );
+
+        token.enable_privileges(&[Privilege::Debug]).expect(
+            "Administrator context lacks SeDebugPrivilege! \
+             Your system policy (secpol.msc) or EDR may have stripped this privilege.",
+        );
+    }
+
+    #[test]
+    #[ignore = "requires elevated Administrator privileges"]
+    fn test_acquire_primary_token_session_zero() {
+        assert_elevated_context();
+
+        let strategy =
+            TrustedInstallerStrategy::new(Duration::from_secs(30), ExecutionContext::Headless);
+        let token = strategy
+            .acquire_primary_token()
+            .expect("Must acquire TrustedInstaller token in Session 0");
+
+        assert!(
+            token
+                .has_sid(TRUSTED_INSTALLER_SID)
+                .expect("Must query SID membership"),
+            "Acquired token must possess genuine TrustedInstaller SID"
+        );
+
+        let session_id = token.session_id().expect("Must read session ID");
+        assert_eq!(
+            session_id, 0,
+            "Headless execution context must strictly bind to Session 0"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires elevated Administrator privileges and an active desktop session"]
+    fn test_acquire_primary_token_caller_session() {
+        assert_elevated_context();
+
+        let strategy = TrustedInstallerStrategy::default();
+        match strategy.acquire_primary_token() {
+            Ok(token) => {
+                assert!(
+                    token
+                        .has_sid(TRUSTED_INSTALLER_SID)
+                        .expect("Must query SID membership"),
+                    "Acquired token must possess genuine TrustedInstaller SID"
+                );
+
+                let caller_session = Token::current().unwrap().session_id().unwrap();
+                assert_eq!(
+                    token.session_id().unwrap(),
+                    caller_session,
+                    "Token must match the caller's active interactive session ID"
+                );
+            }
+            Err(ElevateError::SessionZeroNotSupported) => {
+                eprintln!(
+                    "[INFO] Running inside Session 0 (CI runner/headless); fast-fail verified."
+                );
+            }
+            Err(e) => panic!("Unexpected failure acquiring token for caller session: {e}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires elevated Administrator privileges"]
+    fn test_acquired_token_session_id_readback() {
+        assert_elevated_context();
+
+        let strategy =
+            TrustedInstallerStrategy::new(Duration::from_secs(30), ExecutionContext::Headless);
+        let token = strategy.acquire_primary_token().unwrap();
+
+        let session_id = token.session_id().expect("Must query session ID");
+        assert_eq!(
+            session_id, 0,
+            "Headless token must be strictly confined to Session 0"
+        );
     }
 }

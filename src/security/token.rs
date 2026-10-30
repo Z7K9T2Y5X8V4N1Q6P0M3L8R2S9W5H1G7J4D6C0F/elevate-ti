@@ -18,7 +18,7 @@ use windows::{
             TokenSessionId, TokenUser,
         },
         System::{
-            SystemServices::MAXIMUM_ALLOWED,
+            SystemServices::{MAXIMUM_ALLOWED, SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY},
             Threading::{
                 GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_INFORMATION,
             },
@@ -27,7 +27,7 @@ use windows::{
     core::PCWSTR,
 };
 
-use super::{HandleGuard, Sid, privilege::Privilege, win32};
+use super::{HandleGuard, privilege::Privilege, sid::Sid, win32};
 use crate::error::ElevateError;
 
 /// Target token type when duplicating an existing security token.
@@ -54,7 +54,7 @@ impl Drop for Token {
 
 impl Token {
     /// Open the token belonging to the current application process.
-    pub fn current() -> Result<Self, ElevateError> {
+    pub(crate) fn current() -> Result<Self, ElevateError> {
         let mut handle = HANDLE::default();
         win32!(OpenProcessToken(
             GetCurrentProcess(),
@@ -65,7 +65,7 @@ impl Token {
     }
 
     /// Open the security token belonging to an arbitrary running process by PID.
-    pub fn from_pid(pid: u32) -> Result<Self, ElevateError> {
+    pub(crate) fn from_pid(pid: u32) -> Result<Self, ElevateError> {
         let proc = HandleGuard(win32!(OpenProcess(PROCESS_QUERY_INFORMATION, false, pid))?);
         let mut token = HANDLE::default();
         win32!(OpenProcessToken(
@@ -82,7 +82,7 @@ impl Token {
     }
 
     /// Duplicate this token as either a Primary or Impersonation token.
-    pub fn duplicate(&self, token_type: TokenType) -> Result<Self, ElevateError> {
+    pub(crate) fn duplicate(&self, token_type: TokenType) -> Result<Self, ElevateError> {
         let access = match token_type {
             TokenType::Primary => TOKEN_ALL_ACCESS,
             TokenType::Impersonation => TOKEN_ACCESS_MASK(MAXIMUM_ALLOWED),
@@ -108,7 +108,7 @@ impl Token {
     ///
     /// If the token does not hold the privilege (e.g. running as non-elevated user),
     /// this returns [`ElevateError::PrivilegeNotHeld`].
-    pub fn enable_privileges(&self, privileges: &[Privilege]) -> Result<(), ElevateError> {
+    pub(crate) fn enable_privileges(&self, privileges: &[Privilege]) -> Result<(), ElevateError> {
         for &privilege in privileges {
             let mut luid = LUID::default();
             win32!(LookupPrivilegeValueW(
@@ -147,7 +147,7 @@ impl Token {
     }
 
     /// Check whether this token is running with elevated Administrator privileges.
-    pub fn is_elevated_admin(&self) -> Result<bool, ElevateError> {
+    pub(crate) fn is_elevated_admin(&self) -> Result<bool, ElevateError> {
         let mut elevation = TOKEN_ELEVATION::default();
         let mut len = 0u32;
 
@@ -163,12 +163,29 @@ impl Token {
     }
 
     /// Check whether this token is a Restricted Token.
-    pub fn is_restricted(&self) -> Result<bool, ElevateError> {
-        Ok(unsafe { IsTokenRestricted(self.0) }.is_ok())
+    ///
+    /// # Errors
+    /// Returns an error if querying token status fails with a genuine OS error (e.g. invalid handle).
+    pub(crate) fn is_restricted(&self) -> Result<bool, ElevateError> {
+        unsafe { SetLastError(WIN32_ERROR(0)) };
+        match unsafe { IsTokenRestricted(self.0) } {
+            Ok(()) => Ok(true),
+            Err(source) => {
+                let err = unsafe { GetLastError() };
+                if err == ERROR_SUCCESS {
+                    Ok(false)
+                } else {
+                    Err(ElevateError::Win32 {
+                        operation: "IsTokenRestricted",
+                        source,
+                    })
+                }
+            }
+        }
     }
 
     /// Query the Integrity Level RID of this token (e.g. 0x4000 = SYSTEM, 0x3000 = HIGH).
-    pub fn integrity_level(&self) -> Result<u32, ElevateError> {
+    pub(crate) fn integrity_level(&self) -> Result<u32, ElevateError> {
         let buf = self.query_info_buffer(TokenIntegrityLevel)?;
         let label = unsafe { &*buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>() };
 
@@ -190,7 +207,7 @@ impl Token {
     }
 
     /// Check whether a specific privilege is present in this token's privilege table.
-    pub fn has_privilege_present(&self, privilege: Privilege) -> Result<bool, ElevateError> {
+    pub(crate) fn has_privilege_present(&self, privilege: Privilege) -> Result<bool, ElevateError> {
         let mut target_luid = LUID::default();
         win32!(LookupPrivilegeValueW(
             PCWSTR::null(),
@@ -213,7 +230,7 @@ impl Token {
     }
 
     /// Query the Windows Session ID currently associated with this token.
-    pub fn session_id(&self) -> Result<u32, ElevateError> {
+    pub(crate) fn session_id(&self) -> Result<u32, ElevateError> {
         let mut session_id = 0u32;
         let mut len = 0u32;
         win32!(GetTokenInformation(
@@ -227,7 +244,7 @@ impl Token {
     }
 
     /// Explicitly assign a Windows Session ID to this token.
-    pub fn set_session_id(&self, session_id: u32) -> Result<(), ElevateError> {
+    pub(crate) fn set_session_id(&self, session_id: u32) -> Result<(), ElevateError> {
         win32!(SetTokenInformation(
             self.0,
             TokenSessionId,
@@ -241,7 +258,7 @@ impl Token {
     ///
     /// Guarantees that the impersonation context is bound to the enclosing scope and
     /// will always revert (`RevertToSelf`) on normal return or during panic unwinding.
-    pub fn with_impersonation<F, R>(&self, f: F) -> Result<R, ElevateError>
+    pub(crate) fn with_impersonation<F, R>(&self, f: F) -> Result<R, ElevateError>
     where
         F: FnOnce() -> Result<R, ElevateError>,
     {
@@ -258,7 +275,7 @@ impl Token {
     }
 
     /// Retrieve the owner user SID string of this token.
-    pub fn user_sid(&self) -> Result<String, ElevateError> {
+    pub(crate) fn user_sid(&self) -> Result<String, ElevateError> {
         let buf = self.query_info_buffer(TokenUser)?;
         let user = unsafe { &*buf.as_ptr().cast::<TOKEN_USER>() };
         Sid::string_from_raw(user.User.Sid)
@@ -278,12 +295,22 @@ impl Token {
         let groups_ptr = unsafe { base.byte_add(groups_offset).cast::<SID_AND_ATTRIBUTES>() };
         let slice = unsafe { slice::from_raw_parts(groups_ptr, count) };
 
-        for g in slice {
-            // SAFETY: `g.Sid` is guaranteed by the OS to point to a valid memory block within
+        for group in slice {
+            // SAFETY: `group.Sid` is guaranteed by the OS to point to a valid memory block within
             // the kernel-populated `TOKEN_GROUPS` buffer, and `target.as_raw()` is backed
             // by our own valid, live `Sid` instance. Neither pointer is modified concurrently.
-            if unsafe { Sid::equal(g.Sid, target.as_raw()) }? {
-                return Ok(true);
+            if unsafe { Sid::equal(group.Sid, target.as_raw()) }? {
+                // Defense-in-depth: Merely holding a SID in a token does not guarantee active membership.
+                // UAC filtered tokens or restricted sandboxes mark sensitive SIDs with `SE_GROUP_USE_FOR_DENY_ONLY`,
+                // effectively disabling them for access authorization while keeping them present in the token.
+                // We ensure the SID is genuinely enabled (`SE_GROUP_ENABLED`) and not relegated to deny-only.
+                let attrs = group.Attributes;
+                let is_enabled = (attrs & (SE_GROUP_ENABLED as u32)) != 0;
+                let is_deny_only = (attrs & (SE_GROUP_USE_FOR_DENY_ONLY as u32)) != 0;
+
+                if is_enabled && !is_deny_only {
+                    return Ok(true);
+                }
             }
         }
 
@@ -334,5 +361,94 @@ impl Drop for ImpersonationGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::core::w;
     static_assertions::assert_not_impl_any!(ImpersonationGuard: Send, Sync);
+
+    // =======================================================================
+    // Non-elevated tests — safe to run in standard / CI environments
+    // =======================================================================
+
+    #[test]
+    fn test_current_token_opens_successfully() {
+        let token = Token::current();
+        assert!(
+            token.is_ok(),
+            "Opening the current process token should always succeed"
+        );
+    }
+
+    #[test]
+    fn test_current_token_session_id_is_valid() {
+        let token = Token::current().unwrap();
+        let session = token.session_id();
+        assert!(session.is_ok(), "Reading session ID must not fail");
+    }
+
+    #[test]
+    fn test_current_token_user_sid_is_nonempty() {
+        let token = Token::current().unwrap();
+        let sid = token.user_sid().unwrap();
+        assert!(
+            sid.starts_with("S-1-"),
+            "User SID must be a valid SID string, got: {sid}"
+        );
+    }
+
+    #[test]
+    fn test_is_elevated_admin_matches_integrity_level() {
+        let token = Token::current().unwrap();
+
+        let is_admin = token.is_elevated_admin().unwrap();
+        let integrity_level = token.integrity_level().unwrap();
+
+        if is_admin {
+            assert!(
+                integrity_level >= 0x3000,
+                "Elevated admin must possess High/System integrity level (>= 0x3000), got: 0x{integrity_level:04X}"
+            );
+        } else {
+            assert!(
+                integrity_level < 0x3000,
+                "Non-elevated user must possess Medium or lower integrity level (< 0x3000), got: 0x{integrity_level:04X}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_current_token_is_not_restricted() {
+        let token = Token::current().unwrap();
+
+        let is_restricted = token.is_restricted().unwrap();
+        assert!(
+            !is_restricted,
+            "Current development/test process should not be a restricted token"
+        );
+    }
+
+    #[test]
+    fn test_has_sid_with_bogus_sid_returns_false() {
+        let token = Token::current().unwrap();
+        let has = token.has_sid(w!("S-1-5-80-0-0-0-0-999999")).unwrap();
+        assert!(!has, "Token should not have a fabricated SID");
+    }
+
+    #[test]
+    fn test_core_privileges_presence_matches_admin_status() {
+        let token = Token::current().unwrap();
+        let is_admin = token.is_elevated_admin().unwrap();
+
+        let has_debug = token.has_privilege_present(Privilege::Debug).unwrap();
+        let has_impersonate = token.has_privilege_present(Privilege::Impersonate).unwrap();
+
+        if is_admin {
+            assert!(
+                has_debug,
+                "Elevated administrator token must hold SeDebugPrivilege in its privilege table"
+            );
+            assert!(
+                has_impersonate,
+                "Elevated administrator token must hold SeImpersonatePrivilege in its privilege table"
+            );
+        }
+    }
 }

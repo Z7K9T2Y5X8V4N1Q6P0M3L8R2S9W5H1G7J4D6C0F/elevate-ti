@@ -32,7 +32,7 @@ Caller (Admin with SeDebugPrivilege)
   └─> 4. CreateProcessWithTokenW (Target Desktop or Headless Context)
 ```
 
-## Usage
+## Installation
 
 Add `elevate-ti` to your `Cargo.toml` by running:
 
@@ -40,13 +40,24 @@ Add `elevate-ti` to your `Cargo.toml` by running:
 cargo add elevate-ti
 ```
 
+## Quick Start
+
+```rust
+use elevate_ti::Command;
+
+// Spawn an interactive TrustedInstaller process on the active desktop
+Command::new("%SystemRoot%\\System32\\cmd.exe")?
+    .args("/k whoami /groups")
+    .spawn()?;
+```
+
 ## Examples
 
 For complete and runnable scenarios, check the [`examples`](examples) directory:
 
 - [`relaunch.rs`](examples/relaunch.rs): Automatic self-elevation and privilege verification.
-- [`spawn_cmd.rs`](examples/spawn_cmd.rs): Spawning interactive processes onto user or secure desktops.
-- [`headless_cmd.rs`](examples/headless_cmd.rs): Non-interactive background execution in Session 0.
+- [`spawn.rs`](examples/spawn.rs): Spawning interactive processes onto user or secure desktops.
+- [`headless.rs`](examples/headless.rs): Non-interactive background execution in Session 0.
 
 ## License
 

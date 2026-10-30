@@ -28,7 +28,7 @@ impl Drop for LocalFreeGuard {
 }
 
 /// Safe RAII wrapper around a native Windows Security Identifier (SID).
-pub struct Sid(PSID);
+pub(crate) struct Sid(PSID);
 
 impl Drop for Sid {
     fn drop(&mut self) {
@@ -42,14 +42,14 @@ impl Drop for Sid {
 
 impl Sid {
     /// Parse a security identifier from a wide string format (e.g. `S-1-5-18`).
-    pub fn parse(s: PCWSTR) -> Result<Self, ElevateError> {
+    pub(crate) fn parse(s: PCWSTR) -> Result<Self, ElevateError> {
         let mut psid = PSID::default();
         win32!(ConvertStringSidToSidW(s, &raw mut psid))?;
         Ok(Self(psid))
     }
 
     /// Access the underlying raw `PSID`.
-    pub const fn as_raw(&self) -> PSID {
+    pub(crate) const fn as_raw(&self) -> PSID {
         self.0
     }
 
@@ -67,7 +67,7 @@ impl Sid {
     ///
     /// Returns [`ElevateError::InvalidTokenBuffer`] if either pointer is null or fails
     /// structural validation via [`IsValidSid`].
-    pub unsafe fn equal(a: PSID, b: PSID) -> Result<bool, ElevateError> {
+    pub(crate) unsafe fn equal(a: PSID, b: PSID) -> Result<bool, ElevateError> {
         if a.0.is_null() || b.0.is_null() {
             return Err(ElevateError::InvalidSid);
         }
@@ -93,7 +93,7 @@ impl Sid {
     }
 
     /// Convert a raw `PSID` into its standard textual format string.
-    pub fn string_from_raw(psid: PSID) -> Result<String, ElevateError> {
+    pub(crate) fn string_from_raw(psid: PSID) -> Result<String, ElevateError> {
         let mut pwstr = PWSTR::null();
         win32!(ConvertSidToStringSidW(psid, &raw mut pwstr))?;
 

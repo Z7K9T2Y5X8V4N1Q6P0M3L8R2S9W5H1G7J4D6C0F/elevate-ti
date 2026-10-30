@@ -1,18 +1,16 @@
 //! Idiomatic, safe Win32 security primitives.
 
 pub mod command;
-pub mod privilege;
-pub mod service;
-pub mod sid;
-pub mod snapshot;
-pub mod token;
+pub(crate) mod privilege;
+pub(crate) mod service;
+pub(crate) mod sid;
+pub(crate) mod snapshot;
+pub(crate) mod token;
 
-pub use command::{ExecutionContext, InteractiveDesktop, TokenCommand};
-pub use privilege::Privilege;
+pub use command::{Command, ExecutionContext, InteractiveDesktop};
 pub use service::{Service, ServiceManager};
-pub use sid::Sid;
 pub use snapshot::ProcessSnapshot;
-pub use token::{Token, TokenType};
+pub use token::Token;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 

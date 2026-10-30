@@ -7,6 +7,7 @@ use std::{
     os::windows::ffi::OsStringExt,
     path::{Path, PathBuf},
     ptr,
+    time::Duration,
 };
 
 use windows::{
@@ -26,7 +27,10 @@ use windows::{
 };
 
 use super::{HandleGuard, token::Token, win32};
-use crate::error::ElevateError;
+use crate::{
+    error::ElevateError,
+    strategy::{ElevationStrategy, TrustedInstallerStrategy},
+};
 
 /// Target interactive desktop window station.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -34,19 +38,16 @@ pub enum InteractiveDesktop {
     /// The standard interactive user desktop (`WinSta0\Default`).
     #[default]
     Default,
-
     /// The secure desktop (`WinSta0\Winlogon`), active during UAC prompts and lock screens.
     Winlogon,
-
     /// The screensaver desktop (`WinSta0\Screen-Saver`).
     Screensaver,
-
     /// A custom Window Station and Desktop object path (e.g. `CustomStation\\CustomDesktop`).
     Custom(String),
 }
 
 impl InteractiveDesktop {
-    /// Create a custom window station and desktop target path.
+    /// Create a custom window station and desktop target path (e.g. `CustomStation\\CustomDesktop`).
     pub fn custom(station_and_desktop: impl Into<String>) -> Self {
         Self::Custom(station_and_desktop.into())
     }
@@ -66,7 +67,6 @@ impl InteractiveDesktop {
 pub enum ExecutionContext {
     /// Run interactively attached to a specific desktop.
     Interactive(InteractiveDesktop),
-
     /// Run as a headless Session 0 process with no window station or desktop attached.
     Headless,
 }
@@ -77,69 +77,76 @@ impl Default for ExecutionContext {
     }
 }
 
-/// RAII guard for destroying the Win32 user environment block.
-struct EnvBlockGuard(*mut c_void);
-
-impl Drop for EnvBlockGuard {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                let _ = DestroyEnvironmentBlock(self.0);
-            }
-        }
-    }
-}
-
-/// Builder for launching processes under a specified primary security token.
+/// A process builder for executing commands with `TrustedInstaller` privileges.
 #[must_use = "commands do nothing unless spawned"]
-pub struct TokenCommand {
+pub struct Command {
     token: Token,
-    exe: Option<PathBuf>,
+    program: Option<PathBuf>,
     args: Option<String>,
     desktop_str: Option<HSTRING>,
 }
 
-impl TokenCommand {
-    /// Create a new command builder bound to an elevated token and its target desktop context.
-    pub fn new(token: Token, desktop: Option<InteractiveDesktop>) -> Self {
-        let desktop_str = desktop.map(|d| HSTRING::from(d.as_str()));
-        Self {
+impl Command {
+    /// Create a new elevated command targeting the default interactive desktop (`WinSta0\Default`).
+    pub fn new(program: impl AsRef<Path>) -> Result<Self, ElevateError> {
+        Self::on_desktop(&InteractiveDesktop::Default, program)
+    }
+
+    /// Create an elevated command strictly for Session 0 headless background execution.
+    pub fn headless(program: impl AsRef<Path>) -> Result<Self, ElevateError> {
+        let strategy =
+            TrustedInstallerStrategy::new(Duration::from_secs(30), ExecutionContext::Headless);
+        let token = strategy.acquire_primary_token()?;
+        Ok(Self {
             token,
-            exe: None,
+            program: Some(expand_env_path(program.as_ref())),
+            args: None,
+            desktop_str: None,
+        })
+    }
+
+    /// Create an elevated command targeting a specific interactive desktop.
+    pub fn on_desktop(
+        desktop: &InteractiveDesktop,
+        program: impl AsRef<Path>,
+    ) -> Result<Self, ElevateError> {
+        let strategy = TrustedInstallerStrategy::new(
+            Duration::from_secs(30),
+            ExecutionContext::Interactive(desktop.clone()),
+        );
+        let token = strategy.acquire_primary_token()?;
+        let desktop_str = Some(HSTRING::from(desktop.as_str()));
+        Ok(Self {
+            token,
+            program: Some(expand_env_path(program.as_ref())),
             args: None,
             desktop_str,
-        }
+        })
     }
 
-    /// Set the target executable to the path of the current binary.
-    pub fn current_exe(mut self) -> Result<Self, ElevateError> {
-        self.exe = Some(env::current_exe()?);
-        Ok(self)
-    }
-
-    /// Set a custom target executable path. Supports environment variables like `%SystemRoot%`.
-    pub fn exe(mut self, path: impl AsRef<Path>) -> Self {
-        self.exe = Some(expand_env_path(path.as_ref()));
-        self
+    /// Relaunch the current running binary with `TrustedInstaller` privileges.
+    pub fn relaunch() -> Result<(), ElevateError> {
+        let current = env::current_exe()?;
+        Self::new(current)?.spawn()
     }
 
     /// Pass a raw command-line string to the process.
+    ///
+    /// This string is passed directly as the `lpCommandLine` parameter to Windows `CreateProcess`.
+    /// If not specified, the command line defaults to the executable path itself.
     pub fn args(mut self, args: impl Into<String>) -> Self {
         self.args = Some(args.into());
         self
     }
 
-    /// Spawn the process under the configured token context.
+    /// Spawn the elevated process.
     pub fn spawn(self) -> Result<(), ElevateError> {
-        let exe_hstr = self.exe.as_ref().map(|p| HSTRING::from(p.as_os_str()));
-
-        let cmd = match (&self.args, &self.exe) {
-            (Some(args), _) => args.clone(),
-            (None, Some(exe)) => format!("\"{}\"", exe.display()),
+        let cmd_line = match (&self.program, &self.args) {
+            (_program, Some(args)) => args.clone(),
+            (Some(program), None) => format!("\"{}\"", program.display()),
             (None, None) => return Err(ElevateError::MissingExePath),
         };
-
-        let mut cmd_utf16: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut cmd_line: Vec<u16> = cmd_line.encode_utf16().chain(std::iter::once(0)).collect();
 
         let mut raw_env_block: *mut c_void = ptr::null_mut();
         win32!(CreateEnvironmentBlock(
@@ -150,7 +157,7 @@ impl TokenCommand {
         let _env_guard = EnvBlockGuard(raw_env_block);
 
         let cwd = env::current_dir()?;
-        let cwd_hstr = HSTRING::from(cwd.as_os_str());
+        let cwd = HSTRING::from(cwd.as_os_str());
 
         let lp_desktop = match &self.desktop_str {
             Some(d) => PWSTR(d.as_ptr().cast_mut()),
@@ -166,19 +173,20 @@ impl TokenCommand {
         };
         let mut pi = PROCESS_INFORMATION::default();
 
-        let app_name = match &exe_hstr {
+        let program = self.program.as_ref().map(|p| HSTRING::from(p.as_os_str()));
+        let app_name = match &program {
             Some(h) => PCWSTR(h.as_ptr()),
             None => PCWSTR::null(),
         };
 
-        let spawn_res = win32!(CreateProcessWithTokenW(
+        let spawn_result = win32!(CreateProcessWithTokenW(
             self.token.as_raw(),
             CREATE_PROCESS_LOGON_FLAGS(0),
             app_name,
-            PWSTR(cmd_utf16.as_mut_ptr()),
+            PWSTR(cmd_line.as_mut_ptr()),
             CREATE_UNICODE_ENVIRONMENT,
             Some(raw_env_block),
-            &cwd_hstr,
+            &cwd,
             &raw const si,
             &raw mut pi,
         ));
@@ -186,14 +194,25 @@ impl TokenCommand {
         let _process_guard = HandleGuard(pi.hProcess);
         let _thread_guard = HandleGuard(pi.hThread);
 
-        spawn_res?;
+        spawn_result?;
         Ok(())
+    }
+}
+
+struct EnvBlockGuard(*mut c_void);
+
+impl Drop for EnvBlockGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                let _ = DestroyEnvironmentBlock(self.0);
+            }
+        }
     }
 }
 
 fn expand_env_path(path: &Path) -> PathBuf {
     let input = HSTRING::from(path.as_os_str());
-
     let needed = unsafe { ExpandEnvironmentStringsW(&input, None) };
     if needed == 0 {
         return path.to_path_buf();
