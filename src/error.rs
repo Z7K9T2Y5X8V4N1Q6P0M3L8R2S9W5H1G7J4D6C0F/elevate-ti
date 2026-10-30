@@ -182,6 +182,10 @@ pub enum ElevateError {
     #[error("Token information buffer is invalid or empty")]
     InvalidTokenBuffer,
 
+    /// A Security Identifier (SID) pointer or structure is invalid or null.
+    #[error("Security identifier (SID) structure or pointer is invalid")]
+    InvalidSid,
+
     /// Binding token to the target Windows Session ID failed post-verification readback.
     #[error(
         "Session ID mismatch: requested binding to session {expected}, but verified as {actual}"

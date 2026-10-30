@@ -5,7 +5,7 @@ use windows::{
         Foundation::{HLOCAL, LocalFree},
         Security::{
             Authorization::{ConvertSidToStringSidW, ConvertStringSidToSidW},
-            EqualSid, PSID,
+            GetLengthSid, IsValidSid, PSID,
         },
     },
     core::{PCWSTR, PWSTR},
@@ -13,6 +13,19 @@ use windows::{
 
 use super::win32;
 use crate::error::ElevateError;
+
+/// RAII guard ensuring any buffer allocated by Win32 APIs returning `HLOCAL` is safely freed.
+struct LocalFreeGuard(HLOCAL);
+
+impl Drop for LocalFreeGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = LocalFree(self.0);
+            }
+        }
+    }
+}
 
 /// Safe RAII wrapper around a native Windows Security Identifier (SID).
 pub struct Sid(PSID);
@@ -41,8 +54,42 @@ impl Sid {
     }
 
     /// Check if two raw binary `PSID` handles represent the identical security principal.
-    pub fn equal(a: PSID, b: PSID) -> bool {
-        unsafe { EqualSid(a, b).is_ok() }
+    ///
+    /// # Safety
+    ///
+    /// Both `a` and `b` must point to valid, readable memory representing SID structures,
+    /// and must remain valid and unmodified for the duration of this call (no concurrent writes).
+    ///
+    /// Note: Passing arbitrary invalid or dangling pointers will cause undefined behavior
+    /// (access violation), as [`IsValidSid`] cannot protect against unmapped memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ElevateError::InvalidTokenBuffer`] if either pointer is null or fails
+    /// structural validation via [`IsValidSid`].
+    pub unsafe fn equal(a: PSID, b: PSID) -> Result<bool, ElevateError> {
+        if a.0.is_null() || b.0.is_null() {
+            return Err(ElevateError::InvalidSid);
+        }
+
+        // Structural integrity validation: ensures SID revision and sub-authority counts are sane.
+        if !unsafe { IsValidSid(a) }.as_bool() || !unsafe { IsValidSid(b) }.as_bool() {
+            return Err(ElevateError::InvalidSid);
+        }
+
+        let len_a = unsafe { GetLengthSid(a) };
+        let len_b = unsafe { GetLengthSid(b) };
+
+        if len_a != len_b {
+            return Ok(false);
+        }
+
+        // Binary comparison: valid SIDs of identical length are identical iff their raw bytes match.
+        // This avoids legacy Win32 GetLastError ambiguity inherent to EqualSid.
+        let a = unsafe { std::slice::from_raw_parts(a.0.cast::<u8>(), len_a as usize) };
+        let b = unsafe { std::slice::from_raw_parts(b.0.cast::<u8>(), len_b as usize) };
+
+        Ok(a == b)
     }
 
     /// Convert a raw `PSID` into its standard textual format string.
@@ -50,10 +97,10 @@ impl Sid {
         let mut pwstr = PWSTR::null();
         win32!(ConvertSidToStringSidW(psid, &raw mut pwstr))?;
 
-        let res = unsafe { pwstr.to_string() }.map_err(|_| ElevateError::InvalidTokenBuffer);
-        unsafe {
-            let _ = LocalFree(HLOCAL(pwstr.0.cast()));
-        }
-        res
+        // Immediately wrap the returned buffer into an RAII guard to guarantee deallocation
+        // even if UTF-16 conversion fails or panics occur.
+        let _guard = LocalFreeGuard(HLOCAL(pwstr.0.cast()));
+
+        unsafe { pwstr.to_string() }.map_err(|_| ElevateError::InvalidTokenBuffer)
     }
 }

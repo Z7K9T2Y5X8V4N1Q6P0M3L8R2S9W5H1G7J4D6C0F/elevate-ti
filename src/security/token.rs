@@ -278,7 +278,16 @@ impl Token {
         let groups_ptr = unsafe { base.byte_add(groups_offset).cast::<SID_AND_ATTRIBUTES>() };
         let slice = unsafe { slice::from_raw_parts(groups_ptr, count) };
 
-        Ok(slice.iter().any(|g| Sid::equal(g.Sid, target.as_raw())))
+        for g in slice {
+            // SAFETY: `g.Sid` is guaranteed by the OS to point to a valid memory block within
+            // the kernel-populated `TOKEN_GROUPS` buffer, and `target.as_raw()` is backed
+            // by our own valid, live `Sid` instance. Neither pointer is modified concurrently.
+            if unsafe { Sid::equal(g.Sid, target.as_raw()) }? {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     /// Query raw token information into a pointer-aligned buffer.
