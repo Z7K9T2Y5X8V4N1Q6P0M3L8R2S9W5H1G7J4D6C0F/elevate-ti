@@ -27,10 +27,7 @@ use windows::{
 };
 
 use super::{HandleGuard, token::Token, win32};
-use crate::{
-    error::ElevateError,
-    strategy::{ElevationStrategy, TrustedInstallerStrategy},
-};
+use crate::{Elevator, error::ElevateError};
 
 /// Target interactive desktop window station.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -94,9 +91,8 @@ impl Command {
 
     /// Create an elevated command strictly for Session 0 headless background execution.
     pub fn headless(program: impl AsRef<Path>) -> Result<Self, ElevateError> {
-        let strategy =
-            TrustedInstallerStrategy::new(Duration::from_secs(30), ExecutionContext::Headless);
-        let token = strategy.acquire_primary_token()?;
+        let elevator = Elevator::new(Duration::from_secs(30), ExecutionContext::Headless);
+        let token = elevator.acquire_primary_token()?;
         Ok(Self {
             token,
             program: Some(expand_env_path(program.as_ref())),
@@ -110,11 +106,11 @@ impl Command {
         desktop: &InteractiveDesktop,
         program: impl AsRef<Path>,
     ) -> Result<Self, ElevateError> {
-        let strategy = TrustedInstallerStrategy::new(
+        let elevator = Elevator::new(
             Duration::from_secs(30),
             ExecutionContext::Interactive(desktop.clone()),
         );
-        let token = strategy.acquire_primary_token()?;
+        let token = elevator.acquire_primary_token()?;
         let desktop_str = Some(HSTRING::from(desktop.as_str()));
         Ok(Self {
             token,

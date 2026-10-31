@@ -1,4 +1,4 @@
-//! Advanced Windows privilege elevation strategy supporting both interactive and headless contexts.
+//! Advanced Windows privilege elevation engine supporting both interactive and headless contexts.
 
 use std::{
     collections::HashSet,
@@ -32,12 +32,9 @@ use crate::{
     SessionDiagnostic,
     error::{ElevateError, ProcessAccessFailure, ProcessDiagnostic},
     security::{
-        ExecutionContext, HandleGuard, ProcessSnapshot, ServiceManager,
-        privilege::Privilege,
-        token::{Token, TokenType},
-        win32,
+        ExecutionContext, HandleGuard, ProcessSnapshot, ServiceManager, Token,
+        privilege::Privilege, token::TokenType, win32,
     },
-    strategy::ElevationStrategy,
 };
 
 const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
@@ -61,7 +58,7 @@ impl Drop for WtsMemoryGuard {
     }
 }
 
-/// Target session binding strategy.
+/// Target session binding policy for elevated tokens.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SessionTarget {
     /// Bind token to the caller's active interactive session.
@@ -73,15 +70,15 @@ pub enum SessionTarget {
     AnyInteractive,
 }
 
-/// Chained elevation strategy utilizing SYSTEM tokens to acquire `TrustedInstaller`.
-pub struct TrustedInstallerStrategy {
+/// Chained elevation engine utilizing SYSTEM tokens to acquire `TrustedInstaller`.
+pub struct Elevator {
     service_timeout: Duration,
     context: ExecutionContext,
     session_target: SessionTarget,
     preferred_system_process: String,
 }
 
-impl Default for TrustedInstallerStrategy {
+impl Default for Elevator {
     fn default() -> Self {
         Self {
             service_timeout: Duration::from_secs(30),
@@ -92,8 +89,8 @@ impl Default for TrustedInstallerStrategy {
     }
 }
 
-impl TrustedInstallerStrategy {
-    /// Create a new strategy specifying timeout and host execution context.
+impl Elevator {
+    /// Create a new elevation instance specifying timeout and host execution context.
     pub fn new(service_timeout: Duration, context: ExecutionContext) -> Self {
         Self {
             service_timeout,
@@ -121,6 +118,56 @@ impl TrustedInstallerStrategy {
     #[must_use]
     pub const fn context(&self) -> &ExecutionContext {
         &self.context
+    }
+
+    /// Execute elevation and return a fully elevated primary security token.
+    pub fn acquire_primary_token(&self) -> Result<Token, ElevateError> {
+        let current_token = Token::current()?;
+        // Fast-fail before attempting SCM or system process operations
+        if !current_token.is_elevated_admin()? {
+            return Err(ElevateError::AdministratorRequired);
+        }
+
+        current_token.enable_privileges(&[Privilege::Debug, Privilege::Impersonate])?;
+
+        let target_session = match self.context {
+            ExecutionContext::Headless => None,
+            ExecutionContext::Interactive(_) => {
+                Some(resolve_session(&current_token, &self.session_target)?)
+            }
+        };
+
+        let ti_pid = ServiceManager::open()?
+            .service(w!("TrustedInstaller"))?
+            .start_and_wait("TrustedInstaller", self.service_timeout)?;
+
+        // Resolve an accessible SYSTEM process entirely from Session 0,
+        // avoiding PPL locks on interactive winlogon.exe or lsass.exe.
+        let system_pid = self.resolve_system_process()?;
+        let system_token = Token::from_pid(system_pid)?.duplicate(TokenType::Impersonation)?;
+
+        // Execute primary token duplication strictly within the bounded impersonation scope.
+        // Impersonating SYSTEM grants SeTcbPrivilege, permitting explicit TokenSessionId reassignment.
+        let ti_primary_token = system_token.with_impersonation(|| {
+            let token = Token::from_pid(ti_pid)?.duplicate(TokenType::Primary)?;
+
+            if let Some(expected_session) = target_session {
+                token.set_session_id(expected_session)?;
+
+                // Readback verification: ensure the session assignment took effect in kernel space
+                // and did not silently fail to prevent silent Session 0 window drop.
+                let actual_session = token.session_id()?;
+                if actual_session != expected_session {
+                    return Err(ElevateError::SessionBindingFailed {
+                        expected: expected_session,
+                        actual: actual_session,
+                    });
+                }
+            }
+            Ok(token)
+        })?;
+
+        Ok(ti_primary_token)
     }
 
     /// Resolves an accessible, unrestricted SYSTEM process in Session 0 via a two-stage scan.
@@ -197,7 +244,6 @@ impl TrustedInstallerStrategy {
             let exe_path = match get_process_image_path(pid) {
                 Ok(path) => path,
                 Err(e) => {
-                    // Security blocks (e.g. AccessDenied from PPL/EDR) are recorded for troubleshooting.
                     diagnostics.push(ProcessDiagnostic {
                         pid,
                         name: name.clone(),
@@ -214,7 +260,6 @@ impl TrustedInstallerStrategy {
             let token = match Token::from_pid(pid) {
                 Ok(token) => token,
                 Err(e) => {
-                    // Security blocks (e.g. AccessDenied from PPL/EDR) are recorded for troubleshooting.
                     diagnostics.push(ProcessDiagnostic {
                         pid,
                         name: name.clone(),
@@ -239,57 +284,6 @@ impl TrustedInstallerStrategy {
         }
 
         Err(ElevateError::NoViableSystemProcess { diagnostics })
-    }
-}
-
-impl ElevationStrategy for TrustedInstallerStrategy {
-    fn acquire_primary_token(&self) -> Result<Token, ElevateError> {
-        let current_token = Token::current()?;
-        // Fast-fail before attempting SCM or system process operations
-        if !current_token.is_elevated_admin()? {
-            return Err(ElevateError::AdministratorRequired);
-        }
-
-        current_token.enable_privileges(&[Privilege::Debug, Privilege::Impersonate])?;
-
-        let target_session = match self.context {
-            ExecutionContext::Headless => None,
-            ExecutionContext::Interactive(_) => {
-                Some(resolve_session(&current_token, &self.session_target)?)
-            }
-        };
-
-        let ti_pid = ServiceManager::open()?
-            .service(w!("TrustedInstaller"))?
-            .start_and_wait("TrustedInstaller", self.service_timeout)?;
-
-        // Resolve an accessible SYSTEM process entirely from Session 0,
-        // avoiding PPL locks on interactive winlogon.exe or lsass.exe.
-        let system_pid = self.resolve_system_process()?;
-        let system_token = Token::from_pid(system_pid)?.duplicate(TokenType::Impersonation)?;
-
-        // Execute primary token duplication strictly within the bounded impersonation scope.
-        // Impersonating SYSTEM grants SeTcbPrivilege, permitting explicit TokenSessionId reassignment.
-        let ti_primary_token = system_token.with_impersonation(|| {
-            let token = Token::from_pid(ti_pid)?.duplicate(TokenType::Primary)?;
-
-            if let Some(expected_session) = target_session {
-                token.set_session_id(expected_session)?;
-
-                // Readback verification: ensure the session assignment took effect in kernel space
-                // and did not silently fail to prevent silent Session 0 window drop.
-                let actual_session = token.session_id()?;
-                if actual_session != expected_session {
-                    return Err(ElevateError::SessionBindingFailed {
-                        expected: expected_session,
-                        actual: actual_session,
-                    });
-                }
-            }
-            Ok(token)
-        })?;
-
-        Ok(ti_primary_token)
     }
 }
 
@@ -396,8 +390,6 @@ fn find_any_interactive_session() -> Result<u32, ElevateError> {
 }
 
 /// Query whether a specific Windows Session currently has an authenticated user logged on.
-///
-/// Returns `Ok(true)` only if a non-empty username string is bound to the target session.
 fn has_logged_on_user(session_id: u32) -> Result<bool, ElevateError> {
     let mut raw_ptr = PWSTR::null();
     let mut bytes = 0u32;
@@ -424,7 +416,7 @@ fn has_logged_on_user(session_id: u32) -> Result<bool, ElevateError> {
     Ok(unsafe { *raw_ptr.0 != 0 })
 }
 
-/// Retrieve the canonical System32 directory (e.g. `C:\Windows\System32`).
+/// Retrieve the canonical System32 directory path (e.g. `C:\Windows\System32`).
 fn get_system32_path() -> Result<PathBuf, ElevateError> {
     let mut buf = [0u16; MAX_PATH as usize];
     let len = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
@@ -459,11 +451,11 @@ fn get_process_image_path(pid: u32) -> Result<PathBuf, ElevateError> {
 }
 
 /// Pure path verification: checks whether a binary is physically located in the System32 folder.
-fn is_in_system32(exe_path: &Path, system32: &Path) -> bool {
+fn is_in_system32(exe_path: &Path, system32_path: &Path) -> bool {
     exe_path
         .parent()
         .and_then(|p| p.to_str())
-        .zip(system32.to_str())
+        .zip(system32_path.to_str())
         .is_some_and(|(parent, sys)| parent.eq_ignore_ascii_case(sys))
 }
 
@@ -511,17 +503,35 @@ mod tests {
     use super::*;
     use crate::InteractiveDesktop;
 
+    const TRUSTED_INSTALLER_SID: windows::core::PCWSTR =
+        windows::core::w!("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464");
+
+    fn assert_elevated_context() {
+        let token = Token::current().expect("Failed to open current process security token");
+
+        assert!(
+            token.is_elevated_admin().unwrap_or(false),
+            "Test execution requires an elevated Administrator context. \
+             Please run from an Administrator prompt."
+        );
+
+        token.enable_privileges(&[Privilege::Debug]).expect(
+            "Administrator context lacks SeDebugPrivilege! \
+             Your system policy (secpol.msc) or EDR may have stripped this privilege.",
+        );
+    }
+
     #[test]
-    fn strategy_default_context_is_interactive_default() {
+    fn elevator_default_context_is_interactive_default() {
         assert_eq!(
-            *TrustedInstallerStrategy::default().context(),
+            *Elevator::default().context(),
             ExecutionContext::Interactive(InteractiveDesktop::Default)
         );
     }
 
     #[test]
-    fn get_system32_directory_succeeds() {
-        let path = get_system32_path().expect("System32 directory must be resolvable");
+    fn get_system32_path_succeeds() {
+        let path = get_system32_path().expect("System32 directory path must be resolvable");
         let path = path.to_string_lossy().to_lowercase();
         assert!(
             path.contains("system32"),
@@ -548,41 +558,41 @@ mod tests {
 
     #[test]
     fn current_process_image_path_resolves_and_not_in_system32() {
-        let system32 = get_system32_path().unwrap();
+        let system32_path = get_system32_path().unwrap();
         let current_pid = std::process::id();
 
         let path = get_process_image_path(current_pid)
             .expect("Should be able to query current process image path");
 
         assert!(
-            !is_in_system32(&path, &system32),
+            !is_in_system32(&path, &system32_path),
             "The test binary ({path:?}) should not appear to be in System32"
         );
     }
 
     #[test]
     fn is_in_system32_path_matching() {
-        let system32 = Path::new(r"C:\Windows\System32");
+        let system32_path = Path::new(r"C:\Windows\System32");
 
         assert!(is_in_system32(
             Path::new(r"C:\Windows\System32\services.exe"),
-            system32
+            system32_path
         ));
         assert!(is_in_system32(
             Path::new(r"c:\windows\system32\svchost.exe"),
-            system32
+            system32_path
         ));
         assert!(!is_in_system32(
             Path::new(r"C:\Windows\System32\drivers\etc"),
-            system32
+            system32_path
         ));
         assert!(!is_in_system32(
             Path::new(r"C:\Windows\explorer.exe"),
-            system32
+            system32_path
         ));
         assert!(!is_in_system32(
             Path::new(r"D:\Tools\fake_services.exe"),
-            system32
+            system32_path
         ));
     }
 
@@ -625,30 +635,8 @@ mod tests {
         match result {
             Ok(s) => assert_eq!(s, session),
             Err(ElevateError::SessionZeroNotSupported) => assert_eq!(session, 0),
-            Err(e) => panic!("Unexpected error: {e}"),
+            Err(e) => panic!("Unexpected failure: {e}"),
         }
-    }
-
-    // =======================================================================
-    // Elevated tests — require Administrator + SeDebugPrivilege + SCM access
-    // =======================================================================
-
-    const TRUSTED_INSTALLER_SID: windows::core::PCWSTR =
-        w!("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464");
-
-    fn assert_elevated_context() {
-        let token = Token::current().expect("Failed to open current process security token");
-
-        assert!(
-            token.is_elevated_admin().unwrap_or(false),
-            "Test execution requires an elevated Administrator context. \
-             Please run from an Administrator prompt."
-        );
-
-        token.enable_privileges(&[Privilege::Debug]).expect(
-            "Administrator context lacks SeDebugPrivilege! \
-             Your system policy (secpol.msc) or EDR may have stripped this privilege.",
-        );
     }
 
     #[test]
@@ -656,9 +644,8 @@ mod tests {
     fn test_acquire_primary_token_session_zero() {
         assert_elevated_context();
 
-        let strategy =
-            TrustedInstallerStrategy::new(Duration::from_secs(30), ExecutionContext::Headless);
-        let token = strategy
+        let elevator = Elevator::new(Duration::from_secs(30), ExecutionContext::Headless);
+        let token = elevator
             .acquire_primary_token()
             .expect("Must acquire TrustedInstaller token in Session 0");
 
@@ -681,8 +668,8 @@ mod tests {
     fn test_acquire_primary_token_caller_session() {
         assert_elevated_context();
 
-        let strategy = TrustedInstallerStrategy::default();
-        match strategy.acquire_primary_token() {
+        let elevator = Elevator::default();
+        match elevator.acquire_primary_token() {
             Ok(token) => {
                 assert!(
                     token
@@ -712,9 +699,8 @@ mod tests {
     fn test_acquired_token_session_id_readback() {
         assert_elevated_context();
 
-        let strategy =
-            TrustedInstallerStrategy::new(Duration::from_secs(30), ExecutionContext::Headless);
-        let token = strategy.acquire_primary_token().unwrap();
+        let elevator = Elevator::new(Duration::from_secs(30), ExecutionContext::Headless);
+        let token = elevator.acquire_primary_token().unwrap();
 
         let session_id = token.session_id().expect("Must query session ID");
         assert_eq!(
