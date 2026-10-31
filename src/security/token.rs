@@ -66,10 +66,10 @@ impl Token {
 
     /// Open the security token belonging to an arbitrary running process by PID.
     pub(crate) fn from_pid(pid: u32) -> Result<Self, ElevateError> {
-        let proc = HandleGuard(win32!(OpenProcess(PROCESS_QUERY_INFORMATION, false, pid))?);
+        let process = HandleGuard(win32!(OpenProcess(PROCESS_QUERY_INFORMATION, false, pid))?);
         let mut token = HANDLE::default();
         win32!(OpenProcessToken(
-            proc.0,
+            process.0,
             TOKEN_ACCESS_MASK(MAXIMUM_ALLOWED),
             &raw mut token
         ))?;
@@ -117,7 +117,7 @@ impl Token {
                 &raw mut luid
             ))?;
 
-            let privs = TOKEN_PRIVILEGES {
+            let privileges = TOKEN_PRIVILEGES {
                 PrivilegeCount: 1,
                 Privileges: [LUID_AND_ATTRIBUTES {
                     Luid: luid,
@@ -129,7 +129,7 @@ impl Token {
             win32!(AdjustTokenPrivileges(
                 self.0,
                 false,
-                Some(ptr::from_ref(&privs)),
+                Some(ptr::from_ref(&privileges)),
                 mem::size_of::<TOKEN_PRIVILEGES>() as u32,
                 None,
                 None,

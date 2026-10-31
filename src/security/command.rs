@@ -13,9 +13,7 @@ use std::{
 use windows::{
     Win32::{
         System::{
-            Environment::{
-                CreateEnvironmentBlock, DestroyEnvironmentBlock, ExpandEnvironmentStringsW,
-            },
+            Environment::{CreateEnvironmentBlock, ExpandEnvironmentStringsW},
             Threading::{
                 CREATE_PROCESS_LOGON_FLAGS, CREATE_UNICODE_ENVIRONMENT, CreateProcessWithTokenW,
                 PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW,
@@ -26,7 +24,7 @@ use windows::{
     core::{HSTRING, PCWSTR, PWSTR},
 };
 
-use super::{HandleGuard, token::Token, win32};
+use super::{EnvBlockGuard, HandleGuard, token::Token, win32};
 use crate::{Elevator, error::ElevateError};
 
 /// Target interactive desktop window station.
@@ -45,8 +43,8 @@ pub enum InteractiveDesktop {
 
 impl InteractiveDesktop {
     /// Create a custom window station and desktop target path (e.g. `CustomStation\\CustomDesktop`).
-    pub fn custom(station_and_desktop: impl Into<String>) -> Self {
-        Self::Custom(station_and_desktop.into())
+    pub fn custom(path: impl Into<String>) -> Self {
+        Self::Custom(path.into())
     }
 
     pub(crate) fn as_str(&self) -> &str {
@@ -54,7 +52,7 @@ impl InteractiveDesktop {
             Self::Default => "WinSta0\\Default",
             Self::Winlogon => "WinSta0\\Winlogon",
             Self::Screensaver => "WinSta0\\Screen-Saver",
-            Self::Custom(station) => station.as_str(),
+            Self::Custom(path) => path.as_str(),
         }
     }
 }
@@ -80,7 +78,7 @@ pub struct Command {
     token: Token,
     program: Option<PathBuf>,
     args: Option<String>,
-    desktop_str: Option<HSTRING>,
+    desktop: Option<HSTRING>,
 }
 
 impl Command {
@@ -97,7 +95,7 @@ impl Command {
             token,
             program: Some(expand_env_path(program.as_ref())),
             args: None,
-            desktop_str: None,
+            desktop: None,
         })
     }
 
@@ -111,12 +109,12 @@ impl Command {
             ExecutionContext::Interactive(desktop.clone()),
         );
         let token = elevator.acquire_primary_token()?;
-        let desktop_str = Some(HSTRING::from(desktop.as_str()));
+        let desktop = Some(HSTRING::from(desktop.as_str()));
         Ok(Self {
             token,
             program: Some(expand_env_path(program.as_ref())),
             args: None,
-            desktop_str,
+            desktop,
         })
     }
 
@@ -144,34 +142,37 @@ impl Command {
         };
         let mut cmd_line: Vec<u16> = cmd_line.encode_utf16().chain(std::iter::once(0)).collect();
 
-        let mut raw_env_block: *mut c_void = ptr::null_mut();
+        let mut env_block: *mut c_void = ptr::null_mut();
         win32!(CreateEnvironmentBlock(
-            &raw mut raw_env_block,
+            &raw mut env_block,
             self.token.as_raw(),
             false
         ))?;
-        let _env_guard = EnvBlockGuard(raw_env_block);
+        let _guard = EnvBlockGuard(env_block);
 
         let cwd = env::current_dir()?;
         let cwd = HSTRING::from(cwd.as_os_str());
 
-        let lp_desktop = match &self.desktop_str {
-            Some(d) => PWSTR(d.as_ptr().cast_mut()),
+        let lp_desktop = match &self.desktop {
+            Some(desktop) => PWSTR(desktop.as_ptr().cast_mut()),
             None => PWSTR::null(),
         };
 
-        let si = STARTUPINFOW {
+        let startup_info = STARTUPINFOW {
             cb: mem::size_of::<STARTUPINFOW>() as u32,
             lpDesktop: lp_desktop,
             dwFlags: STARTF_USESHOWWINDOW,
             wShowWindow: SW_SHOWNORMAL.0 as u16,
             ..Default::default()
         };
-        let mut pi = PROCESS_INFORMATION::default();
+        let mut process_info = PROCESS_INFORMATION::default();
 
-        let program = self.program.as_ref().map(|p| HSTRING::from(p.as_os_str()));
+        let program = self
+            .program
+            .as_ref()
+            .map(|path| HSTRING::from(path.as_os_str()));
         let app_name = match &program {
-            Some(h) => PCWSTR(h.as_ptr()),
+            Some(app_name) => PCWSTR(app_name.as_ptr()),
             None => PCWSTR::null(),
         };
 
@@ -181,29 +182,17 @@ impl Command {
             app_name,
             PWSTR(cmd_line.as_mut_ptr()),
             CREATE_UNICODE_ENVIRONMENT,
-            Some(raw_env_block),
+            Some(env_block),
             &cwd,
-            &raw const si,
-            &raw mut pi,
+            &raw const startup_info,
+            &raw mut process_info,
         ));
 
-        let _process_guard = HandleGuard(pi.hProcess);
-        let _thread_guard = HandleGuard(pi.hThread);
+        let _process_guard = HandleGuard(process_info.hProcess);
+        let _thread_guard = HandleGuard(process_info.hThread);
 
         spawn_result?;
         Ok(())
-    }
-}
-
-struct EnvBlockGuard(*mut c_void);
-
-impl Drop for EnvBlockGuard {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                let _ = DestroyEnvironmentBlock(self.0);
-            }
-        }
     }
 }
 
@@ -285,14 +274,14 @@ mod tests {
     fn expand_env_path_with_systemroot() {
         let input = Path::new("%SystemRoot%\\System32\\cmd.exe");
         let result = expand_env_path(input);
-        let result_str = result.to_string_lossy();
+        let result = result.to_string_lossy();
         assert!(
-            !result_str.contains('%'),
-            "Environment variable should have been expanded, got: {result_str}"
+            !result.contains('%'),
+            "Environment variable should have been expanded, got: {result}"
         );
         assert!(
-            result_str.ends_with("\\System32\\cmd.exe"),
-            "Suffix must be preserved, got: {result_str}"
+            result.ends_with("\\System32\\cmd.exe"),
+            "Suffix must be preserved, got: {result}"
         );
     }
 }

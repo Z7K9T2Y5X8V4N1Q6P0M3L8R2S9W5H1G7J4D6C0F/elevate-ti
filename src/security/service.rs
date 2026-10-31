@@ -168,8 +168,8 @@ impl Service {
     }
 
     fn try_start(&self) -> Result<(), ElevateError> {
-        let res = win32!(StartServiceW(self.0, None));
-        match res {
+        let result = win32!(StartServiceW(self.0, None));
+        match result {
             Ok(()) => Ok(()),
             Err(ElevateError::Win32 { ref source, .. })
                 if source.code() == ERROR_SERVICE_ALREADY_RUNNING.to_hresult() =>

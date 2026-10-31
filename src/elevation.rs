@@ -2,7 +2,6 @@
 
 use std::{
     collections::HashSet,
-    ffi::c_void,
     path::{Path, PathBuf},
     slice,
     time::Duration,
@@ -14,8 +13,7 @@ use windows::{
         System::{
             RemoteDesktop::{
                 WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW, WTSActive, WTSEnumerateSessionsW,
-                WTSFreeMemory, WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW,
-                WTSUserName,
+                WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW, WTSUserName,
             },
             SystemInformation::GetSystemDirectoryW,
             SystemServices::SECURITY_MANDATORY_SYSTEM_RID,
@@ -32,7 +30,7 @@ use crate::{
     SessionDiagnostic,
     error::{ElevateError, ProcessAccessFailure, ProcessDiagnostic},
     security::{
-        ExecutionContext, HandleGuard, ProcessSnapshot, ServiceManager, Token,
+        ExecutionContext, HandleGuard, ProcessSnapshot, ServiceManager, Token, WtsMemoryGuard,
         privilege::Privilege, token::TokenType, win32,
     },
 };
@@ -45,18 +43,6 @@ const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
 /// protections in modern Windows (unlike `lsass.exe` with RunAs-PPL or `wininit.exe` with WinTCB-Light),
 /// ensuring unrestricted token access under `SeDebugPrivilege`.
 const DEFAULT_SYSTEM_PROCESS: &str = "services.exe";
-
-struct WtsMemoryGuard(*mut c_void);
-
-impl Drop for WtsMemoryGuard {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                WTSFreeMemory(self.0);
-            }
-        }
-    }
-}
 
 /// Target session binding policy for elevated tokens.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -109,8 +95,8 @@ impl Elevator {
 
     /// Configure a custom session target policy for interactive contexts.
     #[must_use]
-    pub fn with_session_target(mut self, session_target: SessionTarget) -> Self {
-        self.session_target = session_target;
+    pub fn with_session_target(mut self, target: SessionTarget) -> Self {
+        self.session_target = target;
         self
     }
 
@@ -308,7 +294,7 @@ fn resolve_session(caller_token: &Token, target: &SessionTarget) -> Result<u32, 
 ///    directly connected to local video/input peripherals.
 /// 2. **Fallback Target**: The first active authenticated remote desktop (RDP) session.
 fn find_any_interactive_session() -> Result<u32, ElevateError> {
-    let mut p_info: *mut WTS_SESSION_INFOW = std::ptr::null_mut();
+    let mut session_info_ptr: *mut WTS_SESSION_INFOW = std::ptr::null_mut();
     let mut count = 0u32;
 
     // Enumerate all active and inactive terminal sessions in the local subsystem.
@@ -316,55 +302,55 @@ fn find_any_interactive_session() -> Result<u32, ElevateError> {
         WTS_CURRENT_SERVER_HANDLE,
         0,
         1,
-        &raw mut p_info,
+        &raw mut session_info_ptr,
         &raw mut count,
     ))?;
 
-    let _session_list_guard = WtsMemoryGuard(p_info.cast());
+    let _guard = WtsMemoryGuard(session_info_ptr.cast());
 
     // Defensive boundary check: In modern Windows, Session 0 is universally guaranteed to exist.
     // If the API returns a null pointer or 0 count despite succeeding, the Terminal Services buffer
     // is corrupted or intercepted by faulty third-party API hooks/EDR drivers.
-    if p_info.is_null() || count == 0 {
+    if session_info_ptr.is_null() || count == 0 {
         return Err(ElevateError::InvalidTokenBuffer);
     }
 
-    let sessions = unsafe { slice::from_raw_parts(p_info, count as usize) };
+    let sessions = unsafe { slice::from_raw_parts(session_info_ptr, count as usize) };
     let console_session_id = unsafe { WTSGetActiveConsoleSessionId() };
 
     let mut candidate: Option<u32> = None;
     let mut diagnostics = Vec::new();
 
-    for s in sessions {
+    for session in sessions {
         // Filter out disconnected (WTSDisconnected), paused, or terminating sessions.
         // `WTSActive` guarantees the session's display and input channels are actively engaged.
-        if s.State != WTSActive {
+        if session.State != WTSActive {
             continue;
         }
 
         // Validate that an authenticated, human user is actually logged into this session.
         // A session in `WTSActive` state may still just be resting at the Windows Logon/Lock screen (LogonUI).
-        match has_logged_on_user(s.SessionId) {
+        match has_logged_on_user(session.SessionId) {
             Ok(true) => {
                 // Priority 1: Physical Console match.
                 // The user is sitting directly in front of the machine's primary display and peripherals.
                 // Short-circuit immediately to avoid spawning onto an incidental background RDP session.
-                if s.SessionId == console_session_id {
-                    return Ok(s.SessionId);
+                if session.SessionId == console_session_id {
+                    return Ok(session.SessionId);
                 }
 
                 // Priority 2: Remote / RDP session fallback.
                 // First-fit arbitration: preserve the first discovered authenticated remote user session,
                 // while continuing the scan in case the physical console session appears later.
                 if candidate.is_none() {
-                    candidate = Some(s.SessionId);
+                    candidate = Some(session.SessionId);
                 }
             }
             Ok(false) => {
                 // The session is physically or remotely connected (Active), but has no bound user identity
                 // (e.g. at the login credential prompt, or a headless display dummy/emulator).
                 diagnostics.push(SessionDiagnostic {
-                    session_id: s.SessionId,
+                    session_id: session.SessionId,
                     reason: ProcessAccessFailure::InternalError {
                         message:
                             "Active session has an empty or unassigned username (e.g. lock screen)"
@@ -376,7 +362,7 @@ fn find_any_interactive_session() -> Result<u32, ElevateError> {
                 // Record API-level access denial or system errors (e.g. 0x80070005 ACCESS_DENIED)
                 // for structured diagnostics instead of silently ignoring the underlying root cause.
                 diagnostics.push(SessionDiagnostic {
-                    session_id: s.SessionId,
+                    session_id: session.SessionId,
                     reason: e.to_access_failure(),
                 });
             }
@@ -406,7 +392,7 @@ fn has_logged_on_user(session_id: u32) -> Result<bool, ElevateError> {
         return Err(ElevateError::InvalidTokenBuffer);
     }
 
-    let _username_buf_guard = WtsMemoryGuard(raw_ptr.0.cast());
+    let _guard = WtsMemoryGuard(raw_ptr.0.cast());
 
     // SAFETY: Terminal Services guarantees a valid null-terminated UTF-16 wide string buffer on success.
     // In C-style wide strings, an empty username (`""`) begins immediately with the null terminator `\0` (0x0000).
@@ -456,7 +442,7 @@ fn is_in_system32(exe_path: &Path, system32_path: &Path) -> bool {
         .parent()
         .and_then(|p| p.to_str())
         .zip(system32_path.to_str())
-        .is_some_and(|(parent, sys)| parent.eq_ignore_ascii_case(sys))
+        .is_some_and(|(parent, system32)| parent.eq_ignore_ascii_case(system32))
 }
 
 /// Verifies whether an opened Token has full, unrestricted SYSTEM capabilities.

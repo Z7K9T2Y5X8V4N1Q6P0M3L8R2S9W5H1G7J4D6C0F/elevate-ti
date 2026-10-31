@@ -11,21 +11,8 @@ use windows::{
     core::{PCWSTR, PWSTR},
 };
 
-use super::win32;
+use super::{LocalFreeGuard, win32};
 use crate::error::ElevateError;
-
-/// RAII guard ensuring any buffer allocated by Win32 APIs returning `HLOCAL` is safely freed.
-struct LocalFreeGuard(HLOCAL);
-
-impl Drop for LocalFreeGuard {
-    fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            unsafe {
-                let _ = LocalFree(self.0);
-            }
-        }
-    }
-}
 
 /// Safe RAII wrapper around a native Windows Security Identifier (SID).
 pub(crate) struct Sid(PSID);
@@ -42,9 +29,9 @@ impl Drop for Sid {
 
 impl Sid {
     /// Parse a security identifier from a wide string format (e.g. `S-1-5-18`).
-    pub(crate) fn parse(s: PCWSTR) -> Result<Self, ElevateError> {
+    pub(crate) fn parse(sid: PCWSTR) -> Result<Self, ElevateError> {
         let mut psid = PSID::default();
-        win32!(ConvertStringSidToSidW(s, &raw mut psid))?;
+        win32!(ConvertStringSidToSidW(sid, &raw mut psid))?;
         Ok(Self(psid))
     }
 
