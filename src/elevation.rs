@@ -30,8 +30,11 @@ use crate::{
     SessionDiagnostic,
     error::{ElevateError, ProcessAccessFailure, ProcessDiagnostic},
     security::{
-        ExecutionContext, HandleGuard, ProcessSnapshot, ServiceManager, Token, WtsMemoryGuard,
-        privilege::Privilege, token::TokenType, win32,
+        ExecutionContext, ProcessSnapshot, ServiceManager, Token,
+        guard::{HandleGuard, WtsMemoryGuard},
+        privilege::Privilege,
+        token::TokenType,
+        win32,
     },
 };
 
@@ -86,10 +89,10 @@ impl Elevator {
         }
     }
 
-    /// Override or append custom candidate Session 0 SYSTEM process names.
+    /// Override the preferred candidate Session 0 SYSTEM process name (default: "services.exe").
     #[must_use]
-    pub fn with_preferred_processes(mut self, process: impl Into<String>) -> Self {
-        self.preferred_system_process = process.into();
+    pub fn with_preferred_system_process(mut self, name: impl Into<String>) -> Self {
+        self.preferred_system_process = name.into();
         self
     }
 
@@ -125,7 +128,7 @@ impl Elevator {
 
         let ti_pid = ServiceManager::open()?
             .service(w!("TrustedInstaller"))?
-            .start_and_wait("TrustedInstaller", self.service_timeout)?;
+            .start_and_wait(self.service_timeout)?;
 
         // Resolve an accessible SYSTEM process entirely from Session 0,
         // avoiding PPL locks on interactive winlogon.exe or lsass.exe.
@@ -174,7 +177,7 @@ impl Elevator {
 
             checked_pids.insert(pid);
 
-            let exe_path = match get_process_image_path(pid) {
+            let image_path = match get_process_image_path(pid) {
                 Ok(path) => path,
                 Err(e) => {
                     diagnostics.push(ProcessDiagnostic {
@@ -186,7 +189,7 @@ impl Elevator {
                 }
             };
 
-            if !is_in_system32(&exe_path, &system32_path) {
+            if !is_in_system32(&image_path, &system32_path) {
                 diagnostics.push(ProcessDiagnostic {
                     pid,
                     name: name.clone(),
@@ -378,14 +381,14 @@ fn find_any_interactive_session() -> Result<u32, ElevateError> {
 /// Query whether a specific Windows Session currently has an authenticated user logged on.
 fn has_logged_on_user(session_id: u32) -> Result<bool, ElevateError> {
     let mut raw_ptr = PWSTR::null();
-    let mut bytes = 0u32;
+    let mut bytes_returned = 0u32;
 
     win32!(WTSQuerySessionInformationW(
         WTS_CURRENT_SERVER_HANDLE,
         session_id,
         WTSUserName,
         &raw mut raw_ptr,
-        &raw mut bytes,
+        &raw mut bytes_returned,
     ))?;
 
     if raw_ptr.is_null() {
@@ -405,11 +408,11 @@ fn has_logged_on_user(session_id: u32) -> Result<bool, ElevateError> {
 /// Retrieve the canonical System32 directory path (e.g. `C:\Windows\System32`).
 fn get_system32_path() -> Result<PathBuf, ElevateError> {
     let mut buf = [0u16; MAX_PATH as usize];
-    let len = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
-    if len == 0 || len > buf.len() {
+    let char_count = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
+    if char_count == 0 || char_count > buf.len() {
         return Err(ElevateError::SystemDirectoryNotFound);
     }
-    Ok(PathBuf::from(String::from_utf16_lossy(&buf[..len])))
+    Ok(PathBuf::from(String::from_utf16_lossy(&buf[..char_count])))
 }
 
 /// Query the full executable image path backing an active process.
@@ -418,21 +421,21 @@ fn get_process_image_path(pid: u32) -> Result<PathBuf, ElevateError> {
     let _guard = HandleGuard(process);
 
     let mut buf = [0u16; 1024];
-    let mut size = buf.len() as u32;
+    let mut char_count = buf.len() as u32;
 
     win32!(QueryFullProcessImageNameW(
         process,
         PROCESS_NAME_FORMAT(0),
         PWSTR(buf.as_mut_ptr()),
-        &raw mut size,
+        &raw mut char_count,
     ))?;
 
-    if size == 0 {
+    if char_count == 0 {
         return Err(ElevateError::InvalidTokenBuffer);
     }
 
     Ok(PathBuf::from(String::from_utf16_lossy(
-        &buf[..size as usize],
+        &buf[..char_count as usize],
     )))
 }
 
@@ -448,14 +451,14 @@ fn is_in_system32(exe_path: &Path, system32_path: &Path) -> bool {
 /// Verifies whether an opened Token has full, unrestricted SYSTEM capabilities.
 fn verify_system_token(
     token: &Token,
-    target_session: Option<u32>,
+    expected_session: Option<u32>,
 ) -> Result<(), ProcessAccessFailure> {
     let sid = token.user_sid().map_err(|e| e.to_access_failure())?;
     if sid != LOCAL_SYSTEM_SID {
         return Err(ProcessAccessFailure::NotSystemSid { sid });
     }
 
-    if let Some(expected) = target_session {
+    if let Some(expected) = expected_session {
         let actual = token.session_id().map_err(|e| e.to_access_failure())?;
         if actual != expected {
             return Err(ProcessAccessFailure::SessionMismatch { expected, actual });
@@ -488,9 +491,10 @@ fn verify_system_token(
 mod tests {
     use super::*;
     use crate::InteractiveDesktop;
+    use windows::core::PCWSTR;
 
-    const TRUSTED_INSTALLER_SID: windows::core::PCWSTR =
-        windows::core::w!("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464");
+    const TRUSTED_INSTALLER_SID: PCWSTR =
+        w!("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464");
 
     fn assert_elevated_context() {
         let token = Token::current().expect("Failed to open current process security token");

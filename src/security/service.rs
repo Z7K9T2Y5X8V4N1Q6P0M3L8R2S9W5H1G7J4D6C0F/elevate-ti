@@ -60,18 +60,28 @@ impl ServiceManager {
             name,
             SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG | SERVICE_START,
         ))?;
-        Ok(Service(handle))
+
+        let service_name =
+            unsafe { name.to_string() }.map_err(|_| ElevateError::InvalidTokenBuffer)?;
+
+        Ok(Service {
+            handle,
+            name: service_name,
+        })
     }
 }
 
 /// Safe RAII handle for an individual Windows service.
-pub struct Service(SC_HANDLE);
+pub struct Service {
+    handle: SC_HANDLE,
+    name: String,
+}
 
 impl Drop for Service {
     fn drop(&mut self) {
-        if !self.0.is_invalid() {
+        if !self.handle.is_invalid() {
             unsafe {
-                let _ = CloseServiceHandle(self.0);
+                let _ = CloseServiceHandle(self.handle);
             }
         }
     }
@@ -79,7 +89,7 @@ impl Drop for Service {
 
 impl Service {
     /// Ensure the service is running and wait until it enters `SERVICE_RUNNING`, returning its PID.
-    pub fn start_and_wait(&self, name: &str, timeout: Duration) -> Result<u32, ElevateError> {
+    pub fn start_and_wait(&self, timeout: Duration) -> Result<u32, ElevateError> {
         let mut deadline = Instant::now() + timeout;
         let mut start_attempted = false;
         let mut stopped_since: Option<Instant> = None;
@@ -89,7 +99,7 @@ impl Service {
             let now = Instant::now();
             if now >= deadline {
                 return Err(ElevateError::ServiceTimeout {
-                    name: name.to_string(),
+                    name: self.name.clone(),
                     seconds: timeout.as_secs(),
                 });
             }
@@ -108,7 +118,7 @@ impl Service {
             };
 
             win32!(QueryServiceStatusEx(
-                self.0,
+                self.handle,
                 SC_STATUS_PROCESS_INFO,
                 Some(status_bytes),
                 &raw mut bytes_needed,
@@ -128,7 +138,7 @@ impl Service {
                     // Grace period expired or service stopped again after transitioning: failure confirmed.
                     _ => {
                         return Err(ElevateError::ServiceFailed {
-                            name: name.to_string(),
+                            name: self.name.clone(),
                             exit_code: status.dwWin32ExitCode,
                             service_exit_code: status.dwServiceSpecificExitCode,
                         });
@@ -168,7 +178,7 @@ impl Service {
     }
 
     fn try_start(&self) -> Result<(), ElevateError> {
-        let result = win32!(StartServiceW(self.0, None));
+        let result = win32!(StartServiceW(self.handle, None));
         match result {
             Ok(()) => Ok(()),
             Err(ElevateError::Win32 { ref source, .. })

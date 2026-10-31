@@ -11,7 +11,7 @@ use windows::{
     core::{PCWSTR, PWSTR},
 };
 
-use super::{LocalFreeGuard, win32};
+use super::{guard::LocalFreeGuard, win32};
 use crate::error::ElevateError;
 
 /// Safe RAII wrapper around a native Windows Security Identifier (SID).
@@ -44,7 +44,7 @@ impl Sid {
     ///
     /// # Safety
     ///
-    /// Both `a` and `b` must point to valid, readable memory representing SID structures,
+    /// Both `lhs` and `rhs` must point to valid, readable memory representing SID structures,
     /// and must remain valid and unmodified for the duration of this call (no concurrent writes).
     ///
     /// Note: Passing arbitrary invalid or dangling pointers will cause undefined behavior
@@ -52,31 +52,31 @@ impl Sid {
     ///
     /// # Errors
     ///
-    /// Returns [`ElevateError::InvalidTokenBuffer`] if either pointer is null or fails
+    /// Returns [`ElevateError::InvalidSid`] if either pointer is null or fails
     /// structural validation via [`IsValidSid`].
-    pub(crate) unsafe fn equal(a: PSID, b: PSID) -> Result<bool, ElevateError> {
-        if a.0.is_null() || b.0.is_null() {
+    pub(crate) unsafe fn equal(lhs: PSID, rhs: PSID) -> Result<bool, ElevateError> {
+        if lhs.0.is_null() || rhs.0.is_null() {
             return Err(ElevateError::InvalidSid);
         }
 
         // Structural integrity validation: ensures SID revision and sub-authority counts are sane.
-        if !unsafe { IsValidSid(a) }.as_bool() || !unsafe { IsValidSid(b) }.as_bool() {
+        if !unsafe { IsValidSid(lhs) }.as_bool() || !unsafe { IsValidSid(rhs) }.as_bool() {
             return Err(ElevateError::InvalidSid);
         }
 
-        let len_a = unsafe { GetLengthSid(a) };
-        let len_b = unsafe { GetLengthSid(b) };
+        let len_lhs = unsafe { GetLengthSid(lhs) };
+        let len_rhs = unsafe { GetLengthSid(rhs) };
 
-        if len_a != len_b {
+        if len_lhs != len_rhs {
             return Ok(false);
         }
 
         // Binary comparison: valid SIDs of identical length are identical iff their raw bytes match.
         // This avoids legacy Win32 GetLastError ambiguity inherent to EqualSid.
-        let a = unsafe { std::slice::from_raw_parts(a.0.cast::<u8>(), len_a as usize) };
-        let b = unsafe { std::slice::from_raw_parts(b.0.cast::<u8>(), len_b as usize) };
+        let bytes_lhs = unsafe { std::slice::from_raw_parts(lhs.0.cast::<u8>(), len_lhs as usize) };
+        let bytes_rhs = unsafe { std::slice::from_raw_parts(rhs.0.cast::<u8>(), len_rhs as usize) };
 
-        Ok(a == b)
+        Ok(bytes_lhs == bytes_rhs)
     }
 
     /// Convert a raw `PSID` into its standard textual format string.

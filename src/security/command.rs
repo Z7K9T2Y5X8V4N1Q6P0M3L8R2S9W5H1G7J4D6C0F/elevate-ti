@@ -24,7 +24,11 @@ use windows::{
     core::{HSTRING, PCWSTR, PWSTR},
 };
 
-use super::{EnvBlockGuard, HandleGuard, token::Token, win32};
+use super::{
+    guard::{EnvBlockGuard, HandleGuard},
+    token::Token,
+    win32,
+};
 use crate::{Elevator, error::ElevateError};
 
 /// Target interactive desktop window station.
@@ -153,14 +157,14 @@ impl Command {
         let cwd = env::current_dir()?;
         let cwd = HSTRING::from(cwd.as_os_str());
 
-        let lp_desktop = match &self.desktop {
+        let desktop = match &self.desktop {
             Some(desktop) => PWSTR(desktop.as_ptr().cast_mut()),
             None => PWSTR::null(),
         };
 
         let startup_info = STARTUPINFOW {
             cb: mem::size_of::<STARTUPINFOW>() as u32,
-            lpDesktop: lp_desktop,
+            lpDesktop: desktop,
             dwFlags: STARTF_USESHOWWINDOW,
             wShowWindow: SW_SHOWNORMAL.0 as u16,
             ..Default::default()
@@ -171,15 +175,15 @@ impl Command {
             .program
             .as_ref()
             .map(|path| HSTRING::from(path.as_os_str()));
-        let app_name = match &program {
-            Some(app_name) => PCWSTR(app_name.as_ptr()),
+        let program_path = match &program {
+            Some(program_path) => PCWSTR(program_path.as_ptr()),
             None => PCWSTR::null(),
         };
 
         let spawn_result = win32!(CreateProcessWithTokenW(
             self.token.as_raw(),
             CREATE_PROCESS_LOGON_FLAGS(0),
-            app_name,
+            program_path,
             PWSTR(cmd_line.as_mut_ptr()),
             CREATE_UNICODE_ENVIRONMENT,
             Some(env_block),

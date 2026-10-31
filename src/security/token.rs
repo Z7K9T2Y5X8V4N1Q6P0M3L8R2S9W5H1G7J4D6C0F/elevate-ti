@@ -27,7 +27,7 @@ use windows::{
     core::PCWSTR,
 };
 
-use super::{HandleGuard, privilege::Privilege, sid::Sid, win32};
+use super::{guard::HandleGuard, privilege::Privilege, sid::Sid, win32};
 use crate::error::ElevateError;
 
 /// Target token type when duplicating an existing security token.
@@ -149,14 +149,14 @@ impl Token {
     /// Check whether this token is running with elevated Administrator privileges.
     pub(crate) fn is_elevated_admin(&self) -> Result<bool, ElevateError> {
         let mut elevation = TOKEN_ELEVATION::default();
-        let mut len = 0u32;
+        let mut bytes_needed = 0u32;
 
         win32!(GetTokenInformation(
             self.0,
             TokenElevation,
             Some(ptr::from_mut(&mut elevation).cast()),
             mem::size_of::<TOKEN_ELEVATION>() as u32,
-            &raw mut len
+            &raw mut bytes_needed
         ))?;
 
         Ok(elevation.TokenIsElevated != 0)
@@ -232,13 +232,13 @@ impl Token {
     /// Query the Windows Session ID currently associated with this token.
     pub(crate) fn session_id(&self) -> Result<u32, ElevateError> {
         let mut session_id = 0u32;
-        let mut len = 0u32;
+        let mut bytes_needed = 0u32;
         win32!(GetTokenInformation(
             self.0,
             TokenSessionId,
             Some(ptr::from_mut(&mut session_id).cast()),
             mem::size_of::<u32>() as u32,
-            &raw mut len
+            &raw mut bytes_needed
         ))?;
         Ok(session_id)
     }
@@ -282,8 +282,8 @@ impl Token {
     }
 
     /// Check whether this token holds membership in the specified string SID.
-    pub fn has_sid(&self, target_sid: PCWSTR) -> Result<bool, ElevateError> {
-        let target = Sid::parse(target_sid)?;
+    pub fn has_sid(&self, sid: PCWSTR) -> Result<bool, ElevateError> {
+        let sid = Sid::parse(sid)?;
         let buf = self.query_info_buffer(TokenGroups)?;
         let base = buf.as_ptr().cast::<TOKEN_GROUPS>();
         let count = unsafe { (*base).GroupCount as usize };
@@ -299,7 +299,7 @@ impl Token {
             // SAFETY: `group.Sid` is guaranteed by the OS to point to a valid memory block within
             // the kernel-populated `TOKEN_GROUPS` buffer, and `target.as_raw()` is backed
             // by our own valid, live `Sid` instance. Neither pointer is modified concurrently.
-            if unsafe { Sid::equal(group.Sid, target.as_raw()) }? {
+            if unsafe { Sid::equal(group.Sid, sid.as_raw()) }? {
                 // Defense-in-depth: Merely holding a SID in a token does not guarantee active membership.
                 // UAC filtered tokens or restricted sandboxes mark sensitive SIDs with `SE_GROUP_USE_FOR_DENY_ONLY`,
                 // effectively disabling them for access authorization while keeping them present in the token.
@@ -322,21 +322,21 @@ impl Token {
         &self,
         class: TOKEN_INFORMATION_CLASS,
     ) -> Result<Vec<usize>, ElevateError> {
-        let mut len = 0u32;
-        let _ = unsafe { GetTokenInformation(self.0, class, None, 0, &raw mut len) };
-        if len == 0 {
+        let mut bytes_needed = 0u32;
+        let _ = unsafe { GetTokenInformation(self.0, class, None, 0, &raw mut bytes_needed) };
+        if bytes_needed == 0 {
             return Err(ElevateError::InvalidTokenBuffer);
         }
 
-        let count = (len as usize).div_ceil(mem::size_of::<usize>());
+        let count = (bytes_needed as usize).div_ceil(mem::size_of::<usize>());
         let mut buf: Vec<usize> = vec![0; count];
 
         win32!(GetTokenInformation(
             self.0,
             class,
             Some(buf.as_mut_ptr().cast()),
-            len,
-            &raw mut len
+            bytes_needed,
+            &raw mut bytes_needed
         ))?;
         Ok(buf)
     }
