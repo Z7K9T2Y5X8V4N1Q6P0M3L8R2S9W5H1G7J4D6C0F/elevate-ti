@@ -23,7 +23,7 @@ use windows::{
             },
         },
     },
-    core::{PWSTR, w},
+    core::PWSTR,
 };
 
 use crate::{
@@ -39,6 +39,7 @@ use crate::{
 };
 
 const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
+const DEFAULT_SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The canonical Session 0 SYSTEM process used as the elevation pivot.
 ///
@@ -70,7 +71,7 @@ pub struct Elevator {
 impl Default for Elevator {
     fn default() -> Self {
         Self {
-            service_timeout: Duration::from_secs(30),
+            service_timeout: DEFAULT_SERVICE_TIMEOUT,
             context: ExecutionContext::default(),
             session_target: SessionTarget::default(),
             preferred_system_process: DEFAULT_SYSTEM_PROCESS.to_string(),
@@ -80,13 +81,25 @@ impl Default for Elevator {
 
 impl Elevator {
     /// Create a new elevation instance specifying timeout and host execution context.
-    pub fn new(service_timeout: Duration, context: ExecutionContext) -> Self {
+    pub fn new(context: ExecutionContext) -> Self {
         Self {
-            service_timeout,
             context,
-            session_target: SessionTarget::CallerSession,
-            preferred_system_process: DEFAULT_SYSTEM_PROCESS.to_string(),
+            ..Default::default()
         }
+    }
+
+    /// Set a custom execution context.
+    #[must_use]
+    pub fn with_context(mut self, context: ExecutionContext) -> Self {
+        self.context = context;
+        self
+    }
+
+    /// Set a custom service startup timeout.
+    #[must_use]
+    pub fn with_service_timeout(mut self, timeout: Duration) -> Self {
+        self.service_timeout = timeout;
+        self
     }
 
     /// Override the preferred candidate Session 0 SYSTEM process name (default: "services.exe").
@@ -127,7 +140,7 @@ impl Elevator {
         };
 
         let ti_pid = ServiceManager::open()?
-            .service(w!("TrustedInstaller"))?
+            .service("TrustedInstaller")?
             .start_and_wait(self.service_timeout)?;
 
         // Resolve an accessible SYSTEM process entirely from Session 0,
@@ -315,7 +328,7 @@ fn find_any_interactive_session() -> Result<u32, ElevateError> {
     // If the API returns a null pointer or 0 count despite succeeding, the Terminal Services buffer
     // is corrupted or intercepted by faulty third-party API hooks/EDR drivers.
     if session_info_ptr.is_null() || count == 0 {
-        return Err(ElevateError::InvalidTokenBuffer);
+        return Err(ElevateError::InvalidSystemBuffer);
     }
 
     let sessions = unsafe { slice::from_raw_parts(session_info_ptr, count as usize) };
@@ -392,7 +405,7 @@ fn has_logged_on_user(session_id: u32) -> Result<bool, ElevateError> {
     ))?;
 
     if raw_ptr.is_null() {
-        return Err(ElevateError::InvalidTokenBuffer);
+        return Err(ElevateError::InvalidBuffer);
     }
 
     let _guard = WtsMemoryGuard(raw_ptr.0.cast());
@@ -431,7 +444,7 @@ fn get_process_image_path(pid: u32) -> Result<PathBuf, ElevateError> {
     ))?;
 
     if char_count == 0 {
-        return Err(ElevateError::InvalidTokenBuffer);
+        return Err(ElevateError::ProcessImagePathUnavailable { pid });
     }
 
     Ok(PathBuf::from(String::from_utf16_lossy(
@@ -491,7 +504,7 @@ fn verify_system_token(
 mod tests {
     use super::*;
     use crate::InteractiveDesktop;
-    use windows::core::PCWSTR;
+    use windows::core::{PCWSTR, w};
 
     const TRUSTED_INSTALLER_SID: PCWSTR =
         w!("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464");
@@ -634,7 +647,7 @@ mod tests {
     fn test_acquire_primary_token_session_zero() {
         assert_elevated_context();
 
-        let elevator = Elevator::new(Duration::from_secs(30), ExecutionContext::Headless);
+        let elevator = Elevator::new(ExecutionContext::Headless);
         let token = elevator
             .acquire_primary_token()
             .expect("Must acquire TrustedInstaller token in Session 0");
@@ -689,7 +702,7 @@ mod tests {
     fn test_acquired_token_session_id_readback() {
         assert_elevated_context();
 
-        let elevator = Elevator::new(Duration::from_secs(30), ExecutionContext::Headless);
+        let elevator = Elevator::new(ExecutionContext::Headless);
         let token = elevator.acquire_primary_token().unwrap();
 
         let session_id = token.session_id().expect("Must query session ID");

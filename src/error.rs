@@ -186,6 +186,21 @@ pub enum ElevateError {
     #[error("Security identifier (SID) structure or pointer is invalid")]
     InvalidSid,
 
+    /// A query to session or system information returned an unexpected null or corrupted buffer.
+    #[error("System information query returned an unexpected null or empty buffer")]
+    InvalidBuffer,
+
+    /// A query to system or session information returned an empty or corrupted buffer.
+    #[error("System query returned an unexpected null or corrupted buffer")]
+    InvalidSystemBuffer,
+
+    /// Failed to query or retrieve the process image executable path.
+    #[error("Failed to query executable image path for PID {pid}")]
+    ProcessImagePathUnavailable {
+        /// The target process ID.
+        pid: u32,
+    },
+
     /// Binding token to the target Windows Session ID failed post-verification readback.
     #[error(
         "Session ID mismatch: requested binding to session {expected}, but verified as {actual}"
@@ -259,7 +274,7 @@ impl ElevateError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::Foundation::E_INVALIDARG;
+    use windows::{Win32::Foundation::E_INVALIDARG, core::HRESULT};
 
     #[test]
     fn to_access_failure_converts_access_denied() {
@@ -277,7 +292,7 @@ mod tests {
 
     #[test]
     fn to_access_failure_converts_generic_win32_error() {
-        let code = windows::core::HRESULT(E_INVALIDARG.0);
+        let code = HRESULT(E_INVALIDARG.0);
         let err = ElevateError::Win32 {
             operation: "SomeCall",
             source: windows::core::Error::from_hresult(code),

@@ -5,17 +5,18 @@ use std::{marker::PhantomData, mem, ptr, slice};
 use windows::{
     Win32::{
         Foundation::{
-            CloseHandle, ERROR_SUCCESS, GetLastError, HANDLE, LUID, SetLastError, WIN32_ERROR,
+            CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, GetLastError, HANDLE, LUID,
+            SetLastError, WIN32_ERROR,
         },
         Security::{
             AdjustTokenPrivileges, DuplicateTokenEx, GetSidSubAuthority, GetSidSubAuthorityCount,
-            GetTokenInformation, ImpersonateLoggedOnUser, IsTokenRestricted, LUID_AND_ATTRIBUTES,
-            LookupPrivilegeValueW, RevertToSelf, SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES,
-            SecurityImpersonation, SetTokenInformation, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES,
-            TOKEN_ALL_ACCESS, TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS,
-            TOKEN_MANDATORY_LABEL, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, TokenElevation,
-            TokenGroups, TokenImpersonation, TokenIntegrityLevel, TokenPrimary, TokenPrivileges,
-            TokenSessionId, TokenUser,
+            GetTokenInformation, ImpersonateLoggedOnUser, IsTokenRestricted, IsValidSid,
+            LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, RevertToSelf, SE_PRIVILEGE_ENABLED,
+            SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation, TOKEN_ACCESS_MASK,
+            TOKEN_ADJUST_PRIVILEGES, TOKEN_ALL_ACCESS, TOKEN_ELEVATION, TOKEN_GROUPS,
+            TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_PRIVILEGES, TOKEN_QUERY,
+            TOKEN_USER, TokenElevation, TokenGroups, TokenImpersonation, TokenIntegrityLevel,
+            TokenPrimary, TokenPrivileges, TokenSessionId, TokenUser,
         },
         System::{
             SystemServices::{MAXIMUM_ALLOWED, SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY},
@@ -185,22 +186,52 @@ impl Token {
     }
 
     /// Query the Integrity Level RID of this token (e.g. 0x4000 = SYSTEM, 0x3000 = HIGH).
+    ///
+    /// # Why are we parsing a SID here?
+    /// An integrity level is fundamentally just a number (e.g. 0x4000 for SYSTEM).
+    /// However, when Microsoft introduced Mandatory Integrity Control (MIC) in Windows Vista,
+    /// instead of altering the core ACL model with a new data structure, they retrofitted
+    /// integrity levels into "pseudo-SIDs" for backwards compatibility.
+    ///
+    /// Unlike normal user/group SIDs (`S-1-5-...`), an integrity label SID uses authority `16`
+    /// (`SECURITY_MANDATORY_LABEL_AUTHORITY`), formatted as:
+    ///
+    /// ```text
+    /// S-1-16-0x4000  (SYSTEM)
+    /// S-1-16-0x3000  (HIGH / Administrator)
+    /// S-1-16-0x2000  (MEDIUM / Standard User)
+    /// S-1-16-0x1000  (LOW / Sandbox)
+    /// ```
+    ///
+    /// The actual numeric level is stored as the final `SubAuthority` value of this pseudo-SID.
     pub(crate) fn integrity_level(&self) -> Result<u32, ElevateError> {
         let buf = self.query_info_buffer(TokenIntegrityLevel)?;
         let label = unsafe { &*buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>() };
 
-        let count_ptr = unsafe { GetSidSubAuthorityCount(label.Label.Sid) };
-        if count_ptr.is_null() {
-            return Err(ElevateError::InvalidTokenBuffer);
-        }
-        let count = unsafe { *count_ptr };
-        if count == 0 {
-            return Err(ElevateError::InvalidTokenBuffer);
+        let sid = label.Label.Sid;
+
+        // Defensive check: Ensure the pseudo-SID pointer is valid and properly formatted
+        // before dereferencing, protecting against corrupted tokens or hooked APIs.
+        if sid.0.is_null() || !unsafe { IsValidSid(sid) }.as_bool() {
+            return Err(ElevateError::InvalidSid);
         }
 
-        let sub_auth_ptr = unsafe { GetSidSubAuthority(label.Label.Sid, count as u32 - 1) };
+        // An integrity pseudo-SID must contain at least one SubAuthority (which holds the RID).
+        let count_ptr = unsafe { GetSidSubAuthorityCount(sid) };
+        if count_ptr.is_null() {
+            return Err(ElevateError::InvalidSid);
+        }
+
+        let count = unsafe { *count_ptr };
+        if count == 0 {
+            return Err(ElevateError::InvalidSid);
+        }
+
+        // Extract the last SubAuthority (at index `count - 1`), which directly yields
+        // the numeric integrity RID (e.g. extracting `0x4000` from `S-1-16-0x4000`).
+        let sub_auth_ptr = unsafe { GetSidSubAuthority(sid, count as u32 - 1) };
         if sub_auth_ptr.is_null() {
-            return Err(ElevateError::InvalidTokenBuffer);
+            return Err(ElevateError::InvalidSid);
         }
 
         Ok(unsafe { *sub_auth_ptr })
@@ -317,20 +348,53 @@ impl Token {
         Ok(false)
     }
 
-    /// Query raw token information into a pointer-aligned buffer.
+    /// Query raw token information into a pointer-aligned memory buffer.
+    ///
+    /// # Why is this a two-stage query?
+    /// Windows token information structures (such as groups, privileges, or labels) are
+    /// dynamically sized and contain internal pointers and trailing arrays. The caller
+    /// cannot know the required buffer size in advance.
+    ///
+    /// The standard Win32 pattern is a two-phase query:
+    /// 1. **Probe Phase**: Call `GetTokenInformation` with a null buffer and length 0.
+    ///    This call is **expected to fail** specifically with `ERROR_INSUFFICIENT_BUFFER`,
+    ///    while the OS populates `bytes_needed` with the exact byte count required.
+    ///    Any other error (such as `ERROR_ACCESS_DENIED` or `ERROR_INVALID_HANDLE`) indicates
+    ///    a genuine OS failure that must be immediately reported rather than swallowed.
+    /// 2. **Fetch Phase**: Allocate a suitably aligned buffer (using `Vec<usize>` to satisfy
+    ///    pointer alignment requirements on 64-bit systems) and call the API again to populate it.
     fn query_info_buffer(
         &self,
         class: TOKEN_INFORMATION_CLASS,
     ) -> Result<Vec<usize>, ElevateError> {
         let mut bytes_needed = 0u32;
-        let _ = unsafe { GetTokenInformation(self.0, class, None, 0, &raw mut bytes_needed) };
+
+        // Stage 1: Probe for required buffer capacity.
+        unsafe {
+            SetLastError(WIN32_ERROR(0));
+            let _ = GetTokenInformation(self.0, class, None, 0, &raw mut bytes_needed);
+            let last_error = GetLastError();
+            // If the probe failed for any reason other than a buffer size shortfall
+            // (e.g. access denied or invalid handle), immediately return the underlying Win32 error.
+            if last_error != ERROR_INSUFFICIENT_BUFFER {
+                return Err(ElevateError::Win32 {
+                    operation: "GetTokenInformation (probe size)",
+                    source: windows::core::Error::from_win32(),
+                });
+            }
+        }
+
+        // Defensive validation: ERROR_INSUFFICIENT_BUFFER guarantees bytes_needed > 0.
+        // A zero length here indicates an impossible kernel state or corrupted return buffer.
         if bytes_needed == 0 {
             return Err(ElevateError::InvalidTokenBuffer);
         }
 
+        // Allocate a buffer guaranteed to be pointer-aligned (aligned to usize boundaries).
         let count = (bytes_needed as usize).div_ceil(mem::size_of::<usize>());
         let mut buf: Vec<usize> = vec![0; count];
 
+        // Stage 2: Retrieve the actual token information payload.
         win32!(GetTokenInformation(
             self.0,
             class,
@@ -338,6 +402,7 @@ impl Token {
             bytes_needed,
             &raw mut bytes_needed
         ))?;
+
         Ok(buf)
     }
 }

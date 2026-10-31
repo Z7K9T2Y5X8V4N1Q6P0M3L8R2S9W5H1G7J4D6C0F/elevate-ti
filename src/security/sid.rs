@@ -88,6 +88,6 @@ impl Sid {
         // even if UTF-16 conversion fails or panics occur.
         let _guard = LocalFreeGuard(HLOCAL(pwstr.0.cast()));
 
-        unsafe { pwstr.to_string() }.map_err(|_| ElevateError::InvalidTokenBuffer)
+        unsafe { pwstr.to_string() }.map_err(|_| ElevateError::InvalidSid)
     }
 }

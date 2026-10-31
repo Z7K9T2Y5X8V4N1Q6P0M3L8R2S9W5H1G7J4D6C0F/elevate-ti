@@ -16,7 +16,7 @@ use windows::{
             SERVICE_STOPPED, StartServiceW,
         },
     },
-    core::PCWSTR,
+    core::{HSTRING, PCWSTR},
 };
 
 use super::win32;
@@ -54,19 +54,16 @@ impl ServiceManager {
     }
 
     /// Open an individual service with query and start rights.
-    pub fn service(&self, name: PCWSTR) -> Result<Service, ElevateError> {
+    pub fn service(&self, name: &str) -> Result<Service, ElevateError> {
         let handle = win32!(OpenServiceW(
             self.0,
-            name,
+            PCWSTR(HSTRING::from(name).as_ptr()),
             SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG | SERVICE_START,
         ))?;
 
-        let service_name =
-            unsafe { name.to_string() }.map_err(|_| ElevateError::InvalidTokenBuffer)?;
-
         Ok(Service {
             handle,
-            name: service_name,
+            name: name.to_string(),
         })
     }
 }

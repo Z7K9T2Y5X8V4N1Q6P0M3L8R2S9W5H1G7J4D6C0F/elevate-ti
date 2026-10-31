@@ -7,7 +7,6 @@ use std::{
     os::windows::ffi::OsStringExt,
     path::{Path, PathBuf},
     ptr,
-    time::Duration,
 };
 
 use windows::{
@@ -93,7 +92,7 @@ impl Command {
 
     /// Create an elevated command strictly for Session 0 headless background execution.
     pub fn headless(program: impl AsRef<Path>) -> Result<Self, ElevateError> {
-        let elevator = Elevator::new(Duration::from_secs(30), ExecutionContext::Headless);
+        let elevator = Elevator::new(ExecutionContext::Headless);
         let token = elevator.acquire_primary_token()?;
         Ok(Self {
             token,
@@ -108,10 +107,7 @@ impl Command {
         desktop: &InteractiveDesktop,
         program: impl AsRef<Path>,
     ) -> Result<Self, ElevateError> {
-        let elevator = Elevator::new(
-            Duration::from_secs(30),
-            ExecutionContext::Interactive(desktop.clone()),
-        );
+        let elevator = Elevator::new(ExecutionContext::Interactive(desktop.clone()));
         let token = elevator.acquire_primary_token()?;
         let desktop = Some(HSTRING::from(desktop.as_str()));
         Ok(Self {
