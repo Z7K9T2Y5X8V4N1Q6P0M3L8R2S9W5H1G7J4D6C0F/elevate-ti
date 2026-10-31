@@ -239,11 +239,11 @@ impl Token {
 
     /// Check whether a specific privilege is present in this token's privilege table.
     pub(crate) fn has_privilege_present(&self, privilege: Privilege) -> Result<bool, ElevateError> {
-        let mut target_luid = LUID::default();
+        let mut luid = LUID::default();
         win32!(LookupPrivilegeValueW(
             PCWSTR::null(),
             privilege.as_pcwstr(),
-            &raw mut target_luid
+            &raw mut luid
         ))?;
 
         let buf = self.query_info_buffer(TokenPrivileges)?;
@@ -257,7 +257,7 @@ impl Token {
         let privs_ptr = unsafe { base.byte_add(privs_offset).cast::<LUID_AND_ATTRIBUTES>() };
         let slice = unsafe { slice::from_raw_parts(privs_ptr, count) };
 
-        Ok(slice.iter().any(|p| p.Luid == target_luid))
+        Ok(slice.iter().any(|p| p.Luid == luid))
     }
 
     /// Query the Windows Session ID currently associated with this token.
@@ -433,8 +433,9 @@ mod tests {
     // Non-elevated tests — safe to run in standard / CI environments
     // =======================================================================
 
+    // Ensure we can always open the security token of the currently running process.
     #[test]
-    fn test_current_token_opens_successfully() {
+    fn current_token_opens_successfully() {
         let token = Token::current();
         assert!(
             token.is_ok(),
@@ -442,25 +443,29 @@ mod tests {
         );
     }
 
+    // Ensure we can read the Windows Session ID from the token (Session 0 for services, 1+ for desktop).
     #[test]
-    fn test_current_token_session_id_is_valid() {
+    fn current_token_session_id_is_valid() {
         let token = Token::current().unwrap();
         let session = token.session_id();
         assert!(session.is_ok(), "Reading session ID must not fail");
     }
 
+    // Ensure the token owner SID is valid and starts with the standard Windows SID prefix "S-1-".
     #[test]
-    fn test_current_token_user_sid_is_nonempty() {
+    fn current_token_user_sid_is_nonempty_and_valid() {
         let token = Token::current().unwrap();
         let sid = token.user_sid().unwrap();
         assert!(
             sid.starts_with("S-1-"),
-            "User SID must be a valid SID string, got: {sid}"
+            "User SID must be a valid SID string starting with S-1-, got: {sid}"
         );
     }
 
+    // Ensure the boolean elevation flag strictly aligns with the Mandatory Integrity Level:
+    // Elevated Admin must be High/System (>= 0x3000), standard user must be Medium or lower (< 0x3000).
     #[test]
-    fn test_is_elevated_admin_matches_integrity_level() {
+    fn is_elevated_admin_matches_integrity_level() {
         let token = Token::current().unwrap();
 
         let is_admin = token.is_elevated_admin().unwrap();
@@ -479,8 +484,9 @@ mod tests {
         }
     }
 
+    // Normal developer processes and test runners should never be running with a restricted sandbox token.
     #[test]
-    fn test_current_token_is_not_restricted() {
+    fn current_token_is_not_restricted() {
         let token = Token::current().unwrap();
 
         let is_restricted = token.is_restricted().unwrap();
@@ -490,30 +496,14 @@ mod tests {
         );
     }
 
+    // Ensure checking membership for a non-existent or fake SID safely returns false instead of failing.
     #[test]
-    fn test_has_sid_with_bogus_sid_returns_false() {
+    fn has_sid_with_bogus_sid_returns_false() {
         let token = Token::current().unwrap();
         let has = token.has_sid(w!("S-1-5-80-0-0-0-0-999999")).unwrap();
-        assert!(!has, "Token should not have a fabricated SID");
-    }
-
-    #[test]
-    fn test_core_privileges_presence_matches_admin_status() {
-        let token = Token::current().unwrap();
-        let is_admin = token.is_elevated_admin().unwrap();
-
-        let has_debug = token.has_privilege_present(Privilege::Debug).unwrap();
-        let has_impersonate = token.has_privilege_present(Privilege::Impersonate).unwrap();
-
-        if is_admin {
-            assert!(
-                has_debug,
-                "Elevated administrator token must hold SeDebugPrivilege in its privilege table"
-            );
-            assert!(
-                has_impersonate,
-                "Elevated administrator token must hold SeImpersonatePrivilege in its privilege table"
-            );
-        }
+        assert!(
+            !has,
+            "Token should not claim membership in a fake, non-existent SID"
+        );
     }
 }

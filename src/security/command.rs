@@ -217,71 +217,67 @@ fn expand_env_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    // Verify each desktop variant outputs the exact station/desktop string required by Windows.
     #[test]
-    fn desktop_default_station_str() {
-        assert_eq!(InteractiveDesktop::Default.as_str(), "WinSta0\\Default");
+    fn interactive_desktop_as_str_maps_to_expected_paths() {
+        let cases = [
+            (InteractiveDesktop::Default, "WinSta0\\Default"),
+            (InteractiveDesktop::Winlogon, "WinSta0\\Winlogon"),
+            (InteractiveDesktop::Screensaver, "WinSta0\\Screen-Saver"),
+            (
+                InteractiveDesktop::custom("CustomStation\\CustomDesktop"),
+                "CustomStation\\CustomDesktop",
+            ),
+            (InteractiveDesktop::custom(""), ""), // Ensure empty path is safely handled without panic
+        ];
+
+        for (desktop, expected) in cases {
+            assert_eq!(desktop.as_str(), expected);
+        }
     }
 
+    // Ensure new commands target the interactive user desktop by default so the window is visible.
     #[test]
-    fn desktop_winlogon_station_str() {
-        assert_eq!(InteractiveDesktop::Winlogon.as_str(), "WinSta0\\Winlogon");
-    }
-
-    #[test]
-    fn desktop_screensaver_station_str() {
-        assert_eq!(
-            InteractiveDesktop::Screensaver.as_str(),
-            "WinSta0\\Screen-Saver"
-        );
-    }
-
-    #[test]
-    fn desktop_custom_station_str() {
-        assert_eq!(
-            InteractiveDesktop::custom("CustomStation\\CustomDesktop").as_str(),
-            "CustomStation\\CustomDesktop"
-        );
-    }
-
-    #[test]
-    fn desktop_custom_empty_string() {
-        assert_eq!(InteractiveDesktop::custom("").as_str(), "");
-    }
-
-    #[test]
-    fn execution_context_default_is_interactive_default() {
+    fn execution_context_default_is_interactive_desktop() {
         assert_eq!(
             ExecutionContext::default(),
             ExecutionContext::Interactive(InteractiveDesktop::Default)
         );
     }
 
+    // Ensure regular file paths without environment variables are returned completely unchanged.
     #[test]
-    fn expand_env_path_without_variables_returns_unchanged() {
-        let cases = [
+    fn expand_env_path_without_vars_returns_unchanged_path() {
+        let test_cases = [
             "C:\\Windows\\System32\\cmd.exe",
             "relative\\path\\to\\file.txt",
             "plain_filename.exe",
         ];
 
-        for case in cases {
-            let input = Path::new(case);
-            assert_eq!(expand_env_path(input), input, "Failed on: {case}");
+        for path in test_cases {
+            let input = Path::new(path);
+            assert_eq!(
+                expand_env_path(input),
+                input,
+                "Regular path got unexpectedly changed: {path}"
+            );
         }
     }
 
+    // Ensure environment variables like %SystemRoot% are properly expanded to real disk paths.
     #[test]
-    fn expand_env_path_with_systemroot() {
+    fn expand_env_path_with_systemroot_expands_variable() {
         let input = Path::new("%SystemRoot%\\System32\\cmd.exe");
         let result = expand_env_path(input);
-        let result = result.to_string_lossy();
+        let result_str = result.to_string_lossy();
+
         assert!(
-            !result.contains('%'),
-            "Environment variable should have been expanded, got: {result}"
+            !result_str.contains('%'),
+            "Environment variable wasn't expanded, '%' is still there: {result_str}"
         );
         assert!(
-            result.ends_with("\\System32\\cmd.exe"),
-            "Suffix must be preserved, got: {result}"
+            result_str.to_lowercase().ends_with("\\system32\\cmd.exe"),
+            "Expected path to end with '\\System32\\cmd.exe', but got: {result_str}"
         );
     }
 }

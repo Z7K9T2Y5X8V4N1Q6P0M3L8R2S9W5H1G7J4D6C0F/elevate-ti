@@ -276,8 +276,10 @@ mod tests {
     use super::*;
     use windows::{Win32::Foundation::E_INVALIDARG, core::HRESULT};
 
+    // Ensure Win32 E_ACCESSDENIED errors are specifically classified as AccessDenied
+    // so we can distinguish permission blocks (like PPL or EDR) during process scanning.
     #[test]
-    fn to_access_failure_converts_access_denied() {
+    fn to_access_failure_classifies_access_denied_error() {
         let err = ElevateError::Win32 {
             operation: "OpenProcessToken",
             source: windows::core::Error::from_hresult(E_ACCESSDENIED),
@@ -286,44 +288,46 @@ mod tests {
             ProcessAccessFailure::AccessDenied { hresult, .. } => {
                 assert_eq!(hresult, E_ACCESSDENIED.0 as u32);
             }
-            other => panic!("Expected AccessDenied, got: {other:?}"),
+            other => panic!("Expected AccessDenied failure, got: {other:?}"),
         }
     }
 
+    // Ensure general Win32 errors (other than AccessDenied) are preserved as Win32Error with their HRESULT.
     #[test]
-    fn to_access_failure_converts_generic_win32_error() {
-        let code = HRESULT(E_INVALIDARG.0);
+    fn to_access_failure_preserves_generic_win32_errors() {
         let err = ElevateError::Win32 {
             operation: "SomeCall",
-            source: windows::core::Error::from_hresult(code),
+            source: windows::core::Error::from_hresult(HRESULT(E_INVALIDARG.0)),
         };
         match err.to_access_failure() {
             ProcessAccessFailure::Win32Error { hresult, .. } => {
                 assert_eq!(hresult, E_INVALIDARG.0 as u32);
             }
-            other => panic!("Expected Win32Error, got: {other:?}"),
+            other => panic!("Expected Win32Error failure, got: {other:?}"),
         }
     }
 
+    // Ensure custom crate errors (like AdministratorRequired) convert cleanly into an InternalError string.
     #[test]
-    fn to_access_failure_converts_internal_elevate_error() {
+    fn to_access_failure_converts_domain_errors_to_internal_error() {
         let err = ElevateError::AdministratorRequired;
         match err.to_access_failure() {
             ProcessAccessFailure::InternalError { message } => {
                 assert!(message.contains("Administrator"));
             }
-            other => panic!("Expected InternalError, got: {other:?}"),
+            other => panic!("Expected InternalError failure, got: {other:?}"),
         }
     }
 
+    // Ensure standard I/O errors are safely formatted and preserved inside an InternalError.
     #[test]
-    fn to_access_failure_converts_io_error() {
+    fn to_access_failure_converts_io_errors_to_internal_error() {
         let err = ElevateError::Io(io::Error::new(io::ErrorKind::NotFound, "file not found"));
         match err.to_access_failure() {
             ProcessAccessFailure::InternalError { message } => {
                 assert!(message.contains("file not found"));
             }
-            other => panic!("Expected InternalError, got: {other:?}"),
+            other => panic!("Expected InternalError failure, got: {other:?}"),
         }
     }
 }

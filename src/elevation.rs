@@ -273,7 +273,6 @@ impl Elevator {
 
             match verify_system_token(&token, Some(0)) {
                 Ok(()) => return Ok(pid),
-
                 Err(ProcessAccessFailure::NotSystemSid { .. }) => {}
                 Err(reason) => {
                     diagnostics.push(ProcessDiagnostic {
@@ -289,16 +288,16 @@ impl Elevator {
     }
 }
 
-fn resolve_session(caller_token: &Token, target: &SessionTarget) -> Result<u32, ElevateError> {
-    match target {
+fn resolve_session(token: &Token, session_target: &SessionTarget) -> Result<u32, ElevateError> {
+    match session_target {
         SessionTarget::CallerSession => {
-            let id = caller_token.session_id()?;
-            if id == 0 {
+            let session_id = token.session_id()?;
+            if session_id == 0 {
                 return Err(ElevateError::SessionZeroNotSupported);
             }
-            Ok(id)
+            Ok(session_id)
         }
-        SessionTarget::Explicit(id) => Ok(*id),
+        SessionTarget::Explicit(session_id) => Ok(*session_id),
         SessionTarget::AnyInteractive => find_any_interactive_session(),
     }
 }
@@ -509,6 +508,7 @@ mod tests {
     const TRUSTED_INSTALLER_SID: PCWSTR =
         w!("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464");
 
+    // Helper: Ensure the current test runner has Administrator rights and SeDebugPrivilege.
     fn assert_elevated_context() {
         let token = Token::current().expect("Failed to open current process security token");
 
@@ -524,6 +524,7 @@ mod tests {
         );
     }
 
+    // Ensure the default configuration targets the active interactive user desktop.
     #[test]
     fn elevator_default_context_is_interactive_default() {
         assert_eq!(
@@ -532,18 +533,20 @@ mod tests {
         );
     }
 
+    // Ensure we can query the Windows System32 directory path (e.g. C:\Windows\System32) without failure.
     #[test]
-    fn get_system32_path_succeeds() {
+    fn get_system32_path_locates_valid_system_directory() {
         let path = get_system32_path().expect("System32 directory path must be resolvable");
-        let path = path.to_string_lossy().to_lowercase();
+        let path_str = path.to_string_lossy().to_lowercase();
         assert!(
-            path.contains("system32"),
-            "Path must contain 'system32', got: {path}"
+            path_str.contains("system32"),
+            "System directory must contain 'system32', got: {path_str}"
         );
     }
 
+    // Edge case: Querying invalid or non-existent PIDs (like PID 0 or PID max) should return a clean Win32 error, not crash.
     #[test]
-    fn get_process_image_path_invalid_pids_fail_with_win32_error() {
+    fn get_process_image_path_with_invalid_pids_returns_win32_error() {
         match get_process_image_path(0) {
             Err(ElevateError::Win32 { operation, .. }) => {
                 assert_eq!(operation, "OpenProcess");
@@ -559,24 +562,28 @@ mod tests {
         }
     }
 
+    // Ensure `get_process_image_path` can successfully retrieve the full executable path of a running process.
     #[test]
-    fn current_process_image_path_resolves_and_not_in_system32() {
+    fn get_process_image_path_returns_valid_path_for_current_process() {
         let system32_path = get_system32_path().unwrap();
         let current_pid = std::process::id();
 
         let path = get_process_image_path(current_pid)
             .expect("Should be able to query current process image path");
 
+        // A normal test binary lives in target\debug\..., so it should never be inside System32.
         assert!(
             !is_in_system32(&path, &system32_path),
-            "The test binary ({path:?}) should not appear to be in System32"
+            "The test binary ({path:?}) should not be located in System32"
         );
     }
 
+    // Verify that `is_in_system32` only returns true for files directly inside the System32 folder.
     #[test]
-    fn is_in_system32_path_matching() {
+    fn is_in_system32_matches_only_direct_children() {
         let system32_path = Path::new(r"C:\Windows\System32");
 
+        // Files directly inside System32 should match (case-insensitive).
         assert!(is_in_system32(
             Path::new(r"C:\Windows\System32\services.exe"),
             system32_path
@@ -585,6 +592,8 @@ mod tests {
             Path::new(r"c:\windows\system32\svchost.exe"),
             system32_path
         ));
+
+        // Subdirectories, parent directories, or other drives should not match.
         assert!(!is_in_system32(
             Path::new(r"C:\Windows\System32\drivers\etc"),
             system32_path
@@ -599,116 +608,114 @@ mod tests {
         ));
     }
 
+    // Ensure `verify_system_token` rejects tokens that do not belong to the Local System account (S-1-5-18).
     #[test]
-    fn verify_system_token_rejects_non_system_token() {
+    fn verify_system_token_rejects_non_system_tokens() {
         let token = Token::current().unwrap();
+        let current_sid = token.user_sid().unwrap();
+
         let result = verify_system_token(&token, None);
-        match result {
-            Err(ProcessAccessFailure::NotSystemSid { sid }) => {
-                assert!(sid.starts_with("S-1-"), "Rejected SID must be valid: {sid}");
-                assert_ne!(sid, LOCAL_SYSTEM_SID);
-            }
-            Ok(()) => {}
-            Err(other) => {
-                panic!("Expected NotSystemSid or Ok, got: {other:?}");
+
+        if current_sid == LOCAL_SYSTEM_SID {
+            // If the test runner itself happens to run as Local System, it should pass.
+            assert!(result.is_ok(), "Local System token should be accepted");
+        } else {
+            // Otherwise, any user or admin token must be rejected with NotSystemSid.
+            match result {
+                Err(ProcessAccessFailure::NotSystemSid { sid }) => {
+                    assert_eq!(sid, current_sid);
+                }
+                other => panic!("Expected NotSystemSid for non-system token, got: {other:?}"),
             }
         }
     }
 
+    // Verify that if a SYSTEM token is from the wrong session, it gets rejected with SessionMismatch.
     #[test]
-    fn verify_system_token_with_session_mismatch() {
-        let token = Token::current().unwrap();
-        let result = verify_system_token(&token, Some(99));
+    #[ignore = "requires SYSTEM or elevated privileges to acquire a genuine SYSTEM token"]
+    fn verify_system_token_detects_session_mismatch() {
+        let elevator = Elevator::new(ExecutionContext::Headless);
+        let system_token = elevator.acquire_primary_token().unwrap();
+
+        let result = verify_system_token(&system_token, Some(89));
         match result {
             Err(ProcessAccessFailure::SessionMismatch { expected, actual }) => {
-                assert_eq!(expected, 99);
-                assert_ne!(actual, 99);
+                assert_eq!(expected, 89);
+                assert_ne!(actual, 89);
             }
-            Err(ProcessAccessFailure::NotSystemSid { .. }) => {}
-            other => panic!("Expected SessionMismatch or NotSystemSid, got: {other:?}"),
+            other => panic!("Expected SessionMismatch, got: {other:?}"),
         }
     }
 
+    // Verify `resolve_session` correctly returns the current active desktop session ID,
+    // and strictly preserves explicitly provided session IDs.
     #[test]
-    fn test_caller_session_matches_current_env() {
+    fn resolve_session_returns_active_or_explicit_session() {
         let token = Token::current().unwrap();
-        let session = token.session_id().unwrap();
+        let current_session = token.session_id().unwrap();
 
-        let result = resolve_session(&token, &SessionTarget::CallerSession);
-        match result {
-            Ok(s) => assert_eq!(s, session),
-            Err(ElevateError::SessionZeroNotSupported) => assert_eq!(session, 0),
-            Err(e) => panic!("Unexpected failure: {e}"),
-        }
+        // 1. Explicit target: must strictly return whatever session ID was passed in.
+        assert_eq!(
+            resolve_session(&token, &SessionTarget::Explicit(42)).unwrap(),
+            42
+        );
+
+        // 2. CallerSession target: since this test runs in an interactive user session (Session >= 1),
+        // it must return the active session ID without errors.
+        assert_eq!(
+            resolve_session(&token, &SessionTarget::CallerSession).unwrap(),
+            current_session
+        );
     }
 
+    // End-to-end test: Acquire a genuine TrustedInstaller token strictly bound to Session 0 (Headless).
     #[test]
     #[ignore = "requires elevated Administrator privileges"]
-    fn test_acquire_primary_token_session_zero() {
+    fn acquire_primary_token_headless_binds_to_session_zero() {
         assert_elevated_context();
 
         let elevator = Elevator::new(ExecutionContext::Headless);
         let token = elevator
             .acquire_primary_token()
-            .expect("Must acquire TrustedInstaller token in Session 0");
+            .expect("Failed to acquire TrustedInstaller token in headless mode");
 
         assert!(
             token
                 .has_sid(TRUSTED_INSTALLER_SID)
-                .expect("Must query SID membership"),
+                .expect("Failed to query SID"),
             "Acquired token must possess genuine TrustedInstaller SID"
         );
 
-        let session_id = token.session_id().expect("Must read session ID");
+        let session_id = token.session_id().expect("Failed to read session ID");
         assert_eq!(
             session_id, 0,
-            "Headless execution context must strictly bind to Session 0"
+            "Headless token must be strictly bound to Session 0"
         );
     }
 
+    // End-to-end test: Acquire a genuine TrustedInstaller token bound to the active user's desktop session.
     #[test]
     #[ignore = "requires elevated Administrator privileges and an active desktop session"]
-    fn test_acquire_primary_token_caller_session() {
+    fn acquire_primary_token_interactive_binds_to_caller_session() {
         assert_elevated_context();
 
-        let elevator = Elevator::default();
-        match elevator.acquire_primary_token() {
-            Ok(token) => {
-                assert!(
-                    token
-                        .has_sid(TRUSTED_INSTALLER_SID)
-                        .expect("Must query SID membership"),
-                    "Acquired token must possess genuine TrustedInstaller SID"
-                );
+        let elevator = Elevator::default(); // Defaults to Interactive desktop
+        let token = elevator
+            .acquire_primary_token()
+            .expect("Failed to acquire TrustedInstaller token for interactive session");
 
-                let caller_session = Token::current().unwrap().session_id().unwrap();
-                assert_eq!(
-                    token.session_id().unwrap(),
-                    caller_session,
-                    "Token must match the caller's active interactive session ID"
-                );
-            }
-            Err(ElevateError::SessionZeroNotSupported) => {
-                eprintln!(
-                    "[INFO] Running inside Session 0 (CI runner/headless); fast-fail verified."
-                );
-            }
-            Err(e) => panic!("Unexpected failure acquiring token for caller session: {e}"),
-        }
-    }
+        assert!(
+            token
+                .has_sid(TRUSTED_INSTALLER_SID)
+                .expect("Failed to query SID"),
+            "Acquired token must possess genuine TrustedInstaller SID"
+        );
 
-    #[test]
-    #[ignore = "requires elevated Administrator privileges"]
-    fn test_acquired_token_session_id_readback() {
-        assert_elevated_context();
-
-        let elevator = Elevator::new(ExecutionContext::Headless);
-        let token = elevator.acquire_primary_token().unwrap();
-
-        let session_id = token.session_id().expect("Must query session ID");
+        let caller_session = Token::current().unwrap().session_id().unwrap();
+        let session_id = token.session_id().expect("Failed to read session ID");
         assert_eq!(
-            session_id, 0,
-            "Headless token must be strictly confined to Session 0"
+            session_id, caller_session,
+            "Interactive token must match the caller's active desktop session ID"
         );
     }
 }
