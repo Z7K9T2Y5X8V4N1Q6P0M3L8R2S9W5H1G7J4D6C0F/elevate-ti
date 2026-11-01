@@ -21,8 +21,8 @@ pub enum ElevationStatus {
 
 /// Check whether the current process holds the `TrustedInstaller` SID in its group tokens.
 pub fn status() -> Result<ElevationStatus, ElevateError> {
-    let token = Token::current()?;
-    if token.has_sid(TRUSTED_INSTALLER_SID)? {
+    let current_token = Token::current()?;
+    if current_token.has_sid(TRUSTED_INSTALLER_SID)? {
         Ok(ElevationStatus::Elevated)
     } else {
         Ok(ElevationStatus::RequiresElevation)

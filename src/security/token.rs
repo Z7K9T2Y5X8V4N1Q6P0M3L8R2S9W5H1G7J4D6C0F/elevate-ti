@@ -436,9 +436,9 @@ mod tests {
     // Ensure we can always open the security token of the currently running process.
     #[test]
     fn current_token_opens_successfully() {
-        let token = Token::current();
+        let current_token = Token::current();
         assert!(
-            token.is_ok(),
+            current_token.is_ok(),
             "Opening the current process token should always succeed"
         );
     }
@@ -446,16 +446,16 @@ mod tests {
     // Ensure we can read the Windows Session ID from the token (Session 0 for services, 1+ for desktop).
     #[test]
     fn current_token_session_id_is_valid() {
-        let token = Token::current().unwrap();
-        let session = token.session_id();
+        let current_token = Token::current().unwrap();
+        let session = current_token.session_id();
         assert!(session.is_ok(), "Reading session ID must not fail");
     }
 
     // Ensure the token owner SID is valid and starts with the standard Windows SID prefix "S-1-".
     #[test]
     fn current_token_user_sid_is_nonempty_and_valid() {
-        let token = Token::current().unwrap();
-        let sid = token.user_sid().unwrap();
+        let current_token = Token::current().unwrap();
+        let sid = current_token.user_sid().unwrap();
         assert!(
             sid.starts_with("S-1-"),
             "User SID must be a valid SID string starting with S-1-, got: {sid}"
@@ -466,10 +466,10 @@ mod tests {
     // Elevated Admin must be High/System (>= 0x3000), standard user must be Medium or lower (< 0x3000).
     #[test]
     fn is_elevated_admin_matches_integrity_level() {
-        let token = Token::current().unwrap();
+        let current_token = Token::current().unwrap();
 
-        let is_admin = token.is_elevated_admin().unwrap();
-        let integrity_level = token.integrity_level().unwrap();
+        let is_admin = current_token.is_elevated_admin().unwrap();
+        let integrity_level = current_token.integrity_level().unwrap();
 
         if is_admin {
             assert!(
@@ -487,9 +487,9 @@ mod tests {
     // Normal developer processes and test runners should never be running with a restricted sandbox token.
     #[test]
     fn current_token_is_not_restricted() {
-        let token = Token::current().unwrap();
+        let current_token = Token::current().unwrap();
 
-        let is_restricted = token.is_restricted().unwrap();
+        let is_restricted = current_token.is_restricted().unwrap();
         assert!(
             !is_restricted,
             "Current development/test process should not be a restricted token"
@@ -499,8 +499,10 @@ mod tests {
     // Ensure checking membership for a non-existent or fake SID safely returns false instead of failing.
     #[test]
     fn has_sid_with_bogus_sid_returns_false() {
-        let token = Token::current().unwrap();
-        let has = token.has_sid(w!("S-1-5-80-0-0-0-0-999999")).unwrap();
+        let current_token = Token::current().unwrap();
+        let has = current_token
+            .has_sid(w!("S-1-5-80-0-0-0-0-999999"))
+            .unwrap();
         assert!(
             !has,
             "Token should not claim membership in a fake, non-existent SID"

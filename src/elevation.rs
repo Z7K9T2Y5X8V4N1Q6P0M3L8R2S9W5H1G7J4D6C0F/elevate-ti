@@ -223,7 +223,7 @@ impl Elevator {
                 }
             };
 
-            match verify_system_token(&token, Some(0)) {
+            match verify_session0_system_token(&token) {
                 Ok(()) => return Ok(pid),
                 Err(reason) => {
                     diagnostics.push(ProcessDiagnostic {
@@ -271,7 +271,7 @@ impl Elevator {
                 }
             };
 
-            match verify_system_token(&token, Some(0)) {
+            match verify_session0_system_token(&token) {
                 Ok(()) => return Ok(pid),
                 Err(ProcessAccessFailure::NotSystemSid { .. }) => {}
                 Err(reason) => {
@@ -460,33 +460,74 @@ fn is_in_system32(exe_path: &Path, system32_path: &Path) -> bool {
         .is_some_and(|(parent, system32)| parent.eq_ignore_ascii_case(system32))
 }
 
-/// Verifies whether an opened Token has full, unrestricted SYSTEM capabilities.
-fn verify_system_token(
-    token: &Token,
-    expected_session: Option<u32>,
-) -> Result<(), ProcessAccessFailure> {
+/// Verifies whether an opened Token has full, unrestricted SYSTEM capabilities in Session 0.
+///
+/// # Why strictly Session 0?
+/// In modern Windows (Win10/11), processes running as `LocalSystem` (`S-1-5-18`) in interactive
+/// user sessions (Session 1+, such as `winlogon.exe`, `dwm.exe`, or `csrss.exe`) are hardened
+/// with high Protected Process Light levels (e.g. `PsProtectedSignerWinTcb-Light`).
+/// Attempting to access them fails early at `OpenProcess` with `0x00000005 (ACCESS_DENIED)`
+/// because the kernel enforces signer/protection level hierarchy checks before evaluating
+/// `SeDebugPrivilege`.
+///
+/// Furthermore, while an interactive SYSTEM token can theoretically be redirected via
+/// explicit `TokenSessionId` rewriting and `STARTUPINFO.lpDesktop` retargeting (requiring
+/// `SeTcbPrivilege`), pivoting through Session 0 core services (such as `services.exe`) is the
+/// most robust, lowest-friction engineering approach:
+/// - Session 0 daemons rarely opt into PPL, allowing standard `PROCESS_QUERY_INFORMATION` access.
+/// - Operating entirely within Session 0 decouples the elevation pipeline from user session
+///   lifecycles, enabling headless, background, and service execution without encountering
+///   cross-session window station or desktop namespace conflicts.
+///
+/// # Why are these granular checks necessary?
+/// Even within Session 0, not every SYSTEM token can be used as an elevation pivot:
+/// 1. **Sandbox / Filtered Tokens**: Sandboxed workers or Defender components may run as
+///    SYSTEM but have their tokens filtered or restricted (`IsTokenRestricted`).
+/// 2. **Integrity Demotion**: Hardened services may be demoted below System integrity.
+/// 3. **Missing Privileges**: The pivot token must possess `SeImpersonatePrivilege` so that
+///    the caller can adopt it on an OS thread to inherit SYSTEM's full privilege set.
+fn verify_session0_system_token(token: &Token) -> Result<(), ProcessAccessFailure> {
+    // Stage 1: Identity verification.
+    // Ensure the token owner SID is strictly Local System (S-1-5-18).
+    // Filters out other service identities like LocalService (S-1-5-19) or NetworkService (S-1-5-20).
     let sid = token.user_sid().map_err(|e| e.to_access_failure())?;
     if sid != LOCAL_SYSTEM_SID {
         return Err(ProcessAccessFailure::NotSystemSid { sid });
     }
 
-    if let Some(expected) = expected_session {
-        let actual = token.session_id().map_err(|e| e.to_access_failure())?;
-        if actual != expected {
-            return Err(ProcessAccessFailure::SessionMismatch { expected, actual });
-        }
+    // Stage 2: Enforce Session 0 boundary.
+    // Core system services strictly reside in Session 0. Confining the pivot to Session 0
+    // avoids interactive PPL-hardened binaries (WinTCB) and ensures the pipeline works
+    // deterministically in both headless background tasks and user desktop launches.
+    let actual = token.session_id().map_err(|e| e.to_access_failure())?;
+    if actual != 0 {
+        return Err(ProcessAccessFailure::SessionMismatch {
+            expected: 0,
+            actual,
+        });
     }
 
+    // Stage 3: Filtered/Restricted token detection.
+    // Rejects restricted tokens where critical privileges are stripped or SIDs are demoted
+    // to deny-only, making them unsuitable as elevation pivots.
     if token.is_restricted().map_err(|e| e.to_access_failure())? {
         return Err(ProcessAccessFailure::RestrictedToken);
     }
 
+    // Stage 4: Mandatory Integrity Level validation.
+    // Confirms the token operates at SYSTEM integrity (0x4000) or higher, protecting against
+    // integrity-demoted SYSTEM processes (e.g. hardened services explicitly lowered via
+    // integrity policy) or isolated sandbox workers.
     let level = token.integrity_level().map_err(|e| e.to_access_failure())?;
     let expected = SECURITY_MANDATORY_SYSTEM_RID as u32;
     if level < expected {
         return Err(ProcessAccessFailure::LowIntegrityLevel { level, expected });
     }
 
+    // Stage 5: Impersonation capability verification.
+    // The elevation engine relies on impersonating this token on the current thread, thereby
+    // operating with SYSTEM's full privilege set (including SeTcbPrivilege) for downstream
+    // token operations. Without SeImpersonatePrivilege present, thread impersonation will fail.
     let has_impersonate = token
         .has_privilege_present(Privilege::Impersonate)
         .map_err(|e| e.to_access_failure())?;
@@ -510,15 +551,16 @@ mod tests {
 
     // Helper: Ensure the current test runner has Administrator rights and SeDebugPrivilege.
     fn assert_elevated_context() {
-        let token = Token::current().expect("Failed to open current process security token");
+        let current_token =
+            Token::current().expect("Failed to open current process security token");
 
         assert!(
-            token.is_elevated_admin().unwrap_or(false),
+            current_token.is_elevated_admin().unwrap_or(false),
             "Test execution requires an elevated Administrator context. \
              Please run from an Administrator prompt."
         );
 
-        token.enable_privileges(&[Privilege::Debug]).expect(
+        current_token.enable_privileges(&[Privilege::Debug]).expect(
             "Administrator context lacks SeDebugPrivilege! \
              Your system policy (secpol.msc) or EDR may have stripped this privilege.",
         );
@@ -608,42 +650,39 @@ mod tests {
         ));
     }
 
-    // Ensure `verify_system_token` rejects tokens that do not belong to the Local System account (S-1-5-18).
+    // Ensure `verify_session0_system_token` accepts only genuine Local System (S-1-5-18) tokens
+    // residing strictly in Session 0, rejecting both non-system accounts and interactive system tokens.
+    //
+    // Context-dependent behavior:
+    // - Normal dev/CI running on an interactive desktop (Session >= 1) will fail fast with NotSystemSid.
+    // - If running as an interactive SYSTEM user (e.g. PsExec in Session 1+), it must fail with SessionMismatch.
+    // - If running directly as a Session 0 daemon/service, it must pass verification.
     #[test]
-    fn verify_system_token_rejects_non_system_tokens() {
-        let token = Token::current().unwrap();
-        let current_sid = token.user_sid().unwrap();
+    fn verify_session0_system_token_rejects_non_system_or_non_session0_tokens() {
+        let current_token = Token::current().unwrap();
+        let current_sid = current_token.user_sid().unwrap();
+        let current_session = current_token.session_id().unwrap();
 
-        let result = verify_system_token(&token, None);
+        let result = verify_session0_system_token(&current_token);
 
-        if current_sid == LOCAL_SYSTEM_SID {
-            // If the test runner itself happens to run as Local System, it should pass.
-            assert!(result.is_ok(), "Local System token should be accepted");
+        if current_sid == LOCAL_SYSTEM_SID && current_session == 0 {
+            assert!(
+                result.is_ok(),
+                "Session 0 Local System token must be accepted"
+            );
+        } else if current_sid != LOCAL_SYSTEM_SID {
+            assert!(
+                matches!(result, Err(ProcessAccessFailure::NotSystemSid { .. })),
+                "Non-system token must be rejected with NotSystemSid"
+            );
         } else {
-            // Otherwise, any user or admin token must be rejected with NotSystemSid.
-            match result {
-                Err(ProcessAccessFailure::NotSystemSid { sid }) => {
-                    assert_eq!(sid, current_sid);
-                }
-                other => panic!("Expected NotSystemSid for non-system token, got: {other:?}"),
-            }
-        }
-    }
-
-    // Verify that if a SYSTEM token is from the wrong session, it gets rejected with SessionMismatch.
-    #[test]
-    #[ignore = "requires SYSTEM or elevated privileges to acquire a genuine SYSTEM token"]
-    fn verify_system_token_detects_session_mismatch() {
-        let elevator = Elevator::new(ExecutionContext::Headless);
-        let system_token = elevator.acquire_primary_token().unwrap();
-
-        let result = verify_system_token(&system_token, Some(89));
-        match result {
-            Err(ProcessAccessFailure::SessionMismatch { expected, actual }) => {
-                assert_eq!(expected, 89);
-                assert_ne!(actual, 89);
-            }
-            other => panic!("Expected SessionMismatch, got: {other:?}"),
+            assert!(
+                matches!(
+                    result,
+                    Err(ProcessAccessFailure::SessionMismatch { expected: 0, .. })
+                ),
+                "System token outside Session 0 must be rejected with SessionMismatch"
+            );
         }
     }
 
@@ -651,19 +690,19 @@ mod tests {
     // and strictly preserves explicitly provided session IDs.
     #[test]
     fn resolve_session_returns_active_or_explicit_session() {
-        let token = Token::current().unwrap();
-        let current_session = token.session_id().unwrap();
+        let current_token = Token::current().unwrap();
+        let current_session = current_token.session_id().unwrap();
 
         // 1. Explicit target: must strictly return whatever session ID was passed in.
         assert_eq!(
-            resolve_session(&token, &SessionTarget::Explicit(42)).unwrap(),
+            resolve_session(&current_token, &SessionTarget::Explicit(42)).unwrap(),
             42
         );
 
         // 2. CallerSession target: since this test runs in an interactive user session (Session >= 1),
         // it must return the active session ID without errors.
         assert_eq!(
-            resolve_session(&token, &SessionTarget::CallerSession).unwrap(),
+            resolve_session(&current_token, &SessionTarget::CallerSession).unwrap(),
             current_session
         );
     }
