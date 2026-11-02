@@ -194,6 +194,17 @@ pub enum ElevateError {
     #[error("System query returned an unexpected null or corrupted buffer")]
     InvalidSystemBuffer,
 
+    /// A buffer allocated to receive a system path was too small to hold the result.
+    #[error(
+        "Buffer too small to receive system path (required: {needed} characters, capacity: {capacity})"
+    )]
+    PathBufferTooSmall {
+        /// Number of UTF-16 code units required by the Windows API.
+        needed: usize,
+        /// Maximum capacity of the allocated buffer.
+        capacity: usize,
+    },
+
     /// Failed to query or retrieve the process image executable path.
     #[error("Failed to query executable image path for PID {pid}")]
     ProcessImagePathUnavailable {
@@ -251,13 +262,30 @@ fn format_diagnostics<T: Display>(diagnostics: &[T]) -> String {
 }
 
 impl ElevateError {
-    /// Normalizes any error variant into a structured [`ProcessAccessFailure`].
+    /// Converts any high-level crate error into a structured [`ProcessAccessFailure`].
+    ///
+    /// # Why do we need this translation layer?
+    /// When scanning through dozens of candidate processes in Session 0, we can't just bail
+    /// out on the first failure—we need to collect the exact reason each candidate was skipped.
+    ///
+    /// But raw Win32 errors are messy: an "Access Denied" error code (`0x80070005`) means
+    /// something radically different from a random file-not-found error. If Windows blocked
+    /// us with `E_ACCESSDENIED`, it almost always points to kernel-level defenses (such as
+    /// Protected Process Light / PPL, Credential Guard, or an aggressive Antivirus/EDR filter driver).
+    ///
+    /// If we treated all errors the same, the user would just see a useless generic error message.
+    /// By plucking out `E_ACCESSDENIED` specifically:
+    /// 1. We isolate hostile security blocks and PPL locks into [`ProcessAccessFailure::AccessDenied`].
+    /// 2. Other OS errors retain their exact Win32 HRESULT code via [`ProcessAccessFailure::Win32Error`].
+    /// 3. Internal logic errors (like missing paths or invalid buffers) fall back cleanly
+    ///    to [`ProcessAccessFailure::InternalError`].
     pub(crate) fn to_access_failure(&self) -> ProcessAccessFailure {
         match self {
             Self::Win32 { source, .. } => {
                 let hresult = source.code().0 as u32;
                 let message = format!("{source}");
 
+                // Check specifically for 0x80070005 (E_ACCESSDENIED)
                 if hresult == E_ACCESSDENIED.0 as u32 {
                     ProcessAccessFailure::AccessDenied { hresult, message }
                 } else {

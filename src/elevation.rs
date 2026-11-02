@@ -2,6 +2,8 @@
 
 use std::{
     collections::HashSet,
+    ffi::OsString,
+    os::windows::ffi::OsStringExt,
     path::{Path, PathBuf},
     slice,
     time::Duration,
@@ -125,7 +127,6 @@ impl Elevator {
     /// Execute elevation and return a fully elevated primary security token.
     pub fn acquire_primary_token(&self) -> Result<Token, ElevateError> {
         let current_token = Token::current()?;
-        // Fast-fail before attempting SCM or system process operations
         if !current_token.is_elevated_admin()? {
             return Err(ElevateError::AdministratorRequired);
         }
@@ -172,28 +173,13 @@ impl Elevator {
         Ok(ti_primary_token)
     }
 
-    /// Finds a usable, unrestricted SYSTEM process inside Session 0 using a two-stage scan.
-    ///
-    /// # The Search Strategy
-    /// - **Stage 1 (Primary Strategy)**: Target `services.exe` first. It runs 24/7, lives in Session 0,
-    ///   and Windows does not lock it down with `WinTCB` PPL armor.
-    /// - **Stage 2 (Fallback Strategy)**: If `services.exe` is blocked (e.g. by hyper-aggressive third-party
-    ///   antivirus hooks), scan all other accessible processes to find another valid Session 0 SYSTEM daemon.
     fn resolve_system_process(&self) -> Result<u32, ElevateError> {
         let system32_path = get_system32_path()?;
 
-        // The Windows ToolHelp snapshot is a one-way street: once you iterate to the end,
-        // you cannot rewind it back to the start.
-        // We collect all processes into a `Vec` upfront so we can loop through them twice
-        // (Stage 1 for services.exe, and Stage 2 for the fallback scan).
-        let processes: Vec<(u32, String)> = ProcessSnapshot::new()?.collect();
-        // Collects rejection reasons for failed candidates. If both stages fail,
-        // we print this full list so the user sees exactly why each process was rejected.
+        let processes: Vec<_> = ProcessSnapshot::new()?.collect();
         let mut diagnostics = Vec::new();
-        // Tracks PIDs already inspected in Stage 1 to avoid wasting time checking them again in Stage 2.
         let mut checked_pids = HashSet::new();
 
-        // Stage 1: Try the preferred target first (defaults to "services.exe").
         for &(pid, ref name) in &processes {
             if !name.eq_ignore_ascii_case(&self.preferred_system_process) {
                 continue;
@@ -201,8 +187,6 @@ impl Elevator {
 
             checked_pids.insert(pid);
 
-            // Step 1: Query the actual executable path on disk.
-            // If we can't even query the path (e.g. access denied), log why and move on.
             let image_path = match get_process_image_path(pid) {
                 Ok(path) => path,
                 Err(e) => {
@@ -214,7 +198,7 @@ impl Elevator {
                     continue;
                 }
             };
-            // Step 2: Path verification. Stop imposter processes running from C:\Temp\services.exe.
+
             if !is_in_system32(&image_path, &system32_path) {
                 diagnostics.push(ProcessDiagnostic {
                     pid,
@@ -224,7 +208,6 @@ impl Elevator {
                 continue;
             }
 
-            // Step 3: Open the process token.
             let token = match Token::from_pid(pid) {
                 Ok(token) => token,
                 Err(e) => {
@@ -237,7 +220,6 @@ impl Elevator {
                 }
             };
 
-            // Step 4: Run the 5-point safety check (Session 0, real SYSTEM SID, un-restricted, etc.).
             match verify_session0_system_token(&token) {
                 Ok(()) => return Ok(pid),
                 Err(reason) => {
@@ -250,13 +232,8 @@ impl Elevator {
             }
         }
 
-        // Stage 2: Fallback scan across all other running processes.
         let current_pid = std::process::id();
         for &(pid, ref name) in &processes {
-            // Skip:
-            // - PID 0 (System Idle) & PID 4 (System Kernel): You cannot open user-mode tokens for the kernel.
-            // - Current PID: We can't elevate by stealing from our own unprivileged self.
-            // - Already checked PIDs: Don't repeat work from Stage 1.
             if pid <= 4 || pid == current_pid || checked_pids.contains(&pid) {
                 continue;
             }
@@ -290,13 +267,7 @@ impl Elevator {
 
             match verify_session0_system_token(&token) {
                 Ok(()) => return Ok(pid),
-
-                // If a process is simply running under a normal user account or network service,
-                // that's totally expected during a full-system scan—don't pollute our error log with it.
                 Err(ProcessAccessFailure::NotSystemSid { .. }) => {}
-
-                // But if it IS a SYSTEM process and failed for another weird reason (e.g. restricted or demoted),
-                // log it in diagnostics so the user knows why it was rejected.
                 Err(reason) => {
                     diagnostics.push(ProcessDiagnostic {
                         pid,
@@ -307,7 +278,6 @@ impl Elevator {
             }
         }
 
-        // If both stages failed, return all collected diagnostics explaining why each candidate was rejected.
         Err(ElevateError::NoViableSystemProcess { diagnostics })
     }
 }
@@ -326,17 +296,10 @@ fn resolve_session(token: &Token, session_target: &SessionTarget) -> Result<u32,
     }
 }
 
-/// Resolves an active, user-authenticated Windows session for interactive UI delegation.
-///
-/// Implements a prioritized two-tier session election algorithm:
-/// 1. **Primary Target**: The physical console session (`WTSGetActiveConsoleSessionId`)
-///    directly connected to local video/input peripherals.
-/// 2. **Fallback Target**: The first active authenticated remote desktop (RDP) session.
 fn find_any_interactive_session() -> Result<u32, ElevateError> {
     let mut session_info_ptr: *mut WTS_SESSION_INFOW = std::ptr::null_mut();
     let mut count = 0u32;
 
-    // Enumerate all active and inactive terminal sessions in the local subsystem.
     win32!(WTSEnumerateSessionsW(
         WTS_CURRENT_SERVER_HANDLE,
         0,
@@ -347,9 +310,6 @@ fn find_any_interactive_session() -> Result<u32, ElevateError> {
 
     let _guard = WtsMemoryGuard(session_info_ptr.cast());
 
-    // Defensive boundary check: In modern Windows, Session 0 is universally guaranteed to exist.
-    // If the API returns a null pointer or 0 count despite succeeding, the Terminal Services buffer
-    // is corrupted or intercepted by faulty third-party API hooks/EDR drivers.
     if session_info_ptr.is_null() || count == 0 {
         return Err(ElevateError::InvalidSystemBuffer);
     }
@@ -361,33 +321,21 @@ fn find_any_interactive_session() -> Result<u32, ElevateError> {
     let mut diagnostics = Vec::new();
 
     for session in sessions {
-        // Filter out disconnected (WTSDisconnected), paused, or terminating sessions.
-        // `WTSActive` guarantees the session's display and input channels are actively engaged.
         if session.State != WTSActive {
             continue;
         }
 
-        // Validate that an authenticated, human user is actually logged into this session.
-        // A session in `WTSActive` state may still just be resting at the Windows Logon/Lock screen (LogonUI).
         match has_logged_on_user(session.SessionId) {
             Ok(true) => {
-                // Priority 1: Physical Console match.
-                // The user is sitting directly in front of the machine's primary display and peripherals.
-                // Short-circuit immediately to avoid spawning onto an incidental background RDP session.
                 if session.SessionId == console_session_id {
                     return Ok(session.SessionId);
                 }
 
-                // Priority 2: Remote / RDP session fallback.
-                // First-fit arbitration: preserve the first discovered authenticated remote user session,
-                // while continuing the scan in case the physical console session appears later.
                 if candidate.is_none() {
                     candidate = Some(session.SessionId);
                 }
             }
             Ok(false) => {
-                // The session is physically or remotely connected (Active), but has no bound user identity
-                // (e.g. at the login credential prompt, or a headless display dummy/emulator).
                 diagnostics.push(SessionDiagnostic {
                     session_id: session.SessionId,
                     reason: ProcessAccessFailure::InternalError {
@@ -398,8 +346,6 @@ fn find_any_interactive_session() -> Result<u32, ElevateError> {
                 });
             }
             Err(e) => {
-                // Record API-level access denial or system errors (e.g. 0x80070005 ACCESS_DENIED)
-                // for structured diagnostics instead of silently ignoring the underlying root cause.
                 diagnostics.push(SessionDiagnostic {
                     session_id: session.SessionId,
                     reason: e.to_access_failure(),
@@ -408,9 +354,6 @@ fn find_any_interactive_session() -> Result<u32, ElevateError> {
         }
     }
 
-    // Unpack candidate: returns `Ok(session_id)` if an RDP fallback candidate was located.
-    // If all candidates were rejected or inaccessible, converts `None` into a detailed error
-    // containing the post-mortem diagnostics log of every rejected session.
     candidate.ok_or(ElevateError::NoInteractiveSession { diagnostics })
 }
 
@@ -433,25 +376,27 @@ fn has_logged_on_user(session_id: u32) -> Result<bool, ElevateError> {
 
     let _guard = WtsMemoryGuard(raw_ptr.0.cast());
 
-    // SAFETY: Terminal Services guarantees a valid null-terminated UTF-16 wide string buffer on success.
-    // In C-style wide strings, an empty username (`""`) begins immediately with the null terminator `\0` (0x0000).
-    // Inspecting the 0th `u16` character is an O(1) non-allocating check:
-    // - `*raw_ptr.0 == 0`: Empty string (unauthenticated session / login screen).
-    // - `*raw_ptr.0 != 0`: Non-empty string (authenticated user actively logged on).
     Ok(unsafe { *raw_ptr.0 != 0 })
 }
 
-/// Retrieve the canonical System32 directory path (e.g. `C:\Windows\System32`).
 fn get_system32_path() -> Result<PathBuf, ElevateError> {
     let mut buf = [0u16; MAX_PATH as usize];
+
     let char_count = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
-    if char_count == 0 || char_count > buf.len() {
+    if char_count == 0 {
         return Err(ElevateError::SystemDirectoryNotFound);
     }
-    Ok(PathBuf::from(String::from_utf16_lossy(&buf[..char_count])))
+
+    if char_count >= buf.len() {
+        return Err(ElevateError::PathBufferTooSmall {
+            needed: char_count,
+            capacity: buf.len(),
+        });
+    }
+
+    Ok(wide_to_path(&buf[..char_count]))
 }
 
-/// Query the full executable image path backing an active process.
 fn get_process_image_path(pid: u32) -> Result<PathBuf, ElevateError> {
     let process = win32!(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid))?;
     let _guard = HandleGuard(process);
@@ -465,35 +410,18 @@ fn get_process_image_path(pid: u32) -> Result<PathBuf, ElevateError> {
         PWSTR(buf.as_mut_ptr()),
         &raw mut char_count,
     ))?;
-
     if char_count == 0 {
         return Err(ElevateError::ProcessImagePathUnavailable { pid });
     }
 
-    Ok(PathBuf::from(String::from_utf16_lossy(
-        &buf[..char_count as usize],
-    )))
+    Ok(wide_to_path(&buf[..char_count as usize]))
 }
 
-/// Pure path verification: checks whether a binary lives directly inside the System32 folder.
-///
-/// # Why check the file path? Why not just trust the process name?
-/// Relying only on process names (like `"services.exe"`) is completely broken:
-/// Anyone can write a fake binary, name it `services.exe`, drop it in `C:\Temp\services.exe`,
-/// and run it. If our elevation code blindly trusted process names, we could accidentally
-/// hijack a malicious imposter process instead of the real Windows service!
-///
-/// Real Windows core services live strictly inside `%SystemRoot%\System32`, which is locked down
-/// by the OS and writable only by `TrustedInstaller`. Verifying the physical folder path guarantees
-/// we only steal tokens from genuine Windows system binaries.
-///
-/// # Why must it be a DIRECT child (`exe_path.parent()`)?
-/// We strictly require the parent directory to match `System32`:
-/// - **Allowed**: `C:\Windows\System32\services.exe` (parent is `System32`).
-/// - **Rejected**: `C:\Windows\System32\drivers\etc\fake.exe` (parent is `drivers\etc`, rejected!).
-/// - **Rejected**: `C:\Windows\explorer.exe` (outside `System32`, rejected!).
-///
-/// This stops someone from hiding an executable in writable subfolders inside the Windows directory.
+#[inline]
+fn wide_to_path(wide: &[u16]) -> PathBuf {
+    PathBuf::from(OsString::from_wide(wide))
+}
+
 fn is_in_system32(exe_path: &Path, system32_path: &Path) -> bool {
     exe_path
         .parent()
@@ -502,45 +430,12 @@ fn is_in_system32(exe_path: &Path, system32_path: &Path) -> bool {
         .is_some_and(|(parent, system32)| parent.eq_ignore_ascii_case(system32))
 }
 
-/// Checks if this token is a real, unrestricted SYSTEM token running in Session 0.
-///
-/// # Why steal from Session 0 instead of `winlogon.exe`?
-/// You might see lazy elevation scripts on GitHub grab `winlogon.exe` in user sessions (Session 1+).
-/// On a standard, unhardened Home Edition PC, that often works because `winlogon.exe` runs as SYSTEM
-/// and isn't locked down by default.
-///
-/// But targeting `winlogon.exe` is a trap that blows up in real-world environments:
-/// 1. **PPL & Credential Guard**: In corporate networks, enterprise editions, or machines with
-///    Credential Guard enabled, Windows wraps interactive auth processes in PPL (Protected Process Light).
-///    When that happens, calling `OpenProcess` on `winlogon.exe` fails with `0x00000005 (ACCESS_DENIED)`—even
-///    if you are an Administrator holding `SeDebugPrivilege`.
-/// 2. **Headless / CI Disaster**: `winlogon.exe` only exists when someone is actually logged into
-///    a physical desktop! If your code runs inside a Windows background service, a scheduled task,
-///    or a headless CI/CD runner (like GitHub Actions), there is NO user desktop, and `winlogon.exe`
-///    won't even exist.
-///
-/// That is why we strictly pivot through Session 0 (`services.exe`):
-/// - It is running 24/7 on every Windows machine, whether a monitor is plugged in or not.
-/// - It is not locked behind user-session PPL armor, making it work universally across Home, Pro,
-///   Enterprise, and headless server environments.
-///
-/// # Why 5 separate checks? (What happens if we skip them?)
-/// Just finding a token that says "SYSTEM" in Session 0 isn't enough. Without these checks:
-/// - We might steal a sandboxed Defender/Antivirus worker that has its permissions neutered.
-/// - We might steal a hardened service token whose integrity level was dropped down to standard user.
-/// - We might steal a token lacking impersonation rights, breaking our thread-stealing code later.
 fn verify_session0_system_token(token: &Token) -> Result<(), ProcessAccessFailure> {
-    // Check 1: Make sure the token actually belongs to Local System ("S-1-5-18").
-    // If we skip this, we might accidentally grab a service running as "LocalService" (S-1-5-19)
-    // or "NetworkService" (S-1-5-20), which have nowhere near the power of true SYSTEM.
     let sid = token.user_sid().map_err(|e| e.to_access_failure())?;
     if sid != LOCAL_SYSTEM_SID {
         return Err(ProcessAccessFailure::NotSystemSid { sid });
     }
 
-    // Check 2: Confirm this token actually lives in Session 0.
-    // If we accidentally grab a SYSTEM token from Session 1 (a logged-in desktop),
-    // our code will blow up the moment we try to use it in background environments or headless CI.
     let actual = token.session_id().map_err(|e| e.to_access_failure())?;
     if actual != 0 {
         return Err(ProcessAccessFailure::SessionMismatch {
@@ -549,26 +444,16 @@ fn verify_session0_system_token(token: &Token) -> Result<(), ProcessAccessFailur
         });
     }
 
-    // Check 3: Check if Windows neutered this token (Restricted / Filtered token).
-    // Some background workers run as SYSTEM, but Windows flags their token as "Restricted"
-    // to lock them in a sandbox. A restricted token cannot be used to elevate anything.
     if token.is_restricted().map_err(|e| e.to_access_failure())? {
         return Err(ProcessAccessFailure::RestrictedToken);
     }
 
-    // Check 4: Check the Integrity Level (must be SYSTEM altitude, 0x4000 or higher).
-    // Windows allows services to drop their own integrity down to Medium or Low to protect themselves.
-    // If we steal an integrity-demoted token, we won't have the permissions needed to hijack TrustedInstaller.
     let level = token.integrity_level().map_err(|e| e.to_access_failure())?;
     let expected = SECURITY_MANDATORY_SYSTEM_RID as u32;
     if level < expected {
         return Err(ProcessAccessFailure::LowIntegrityLevel { level, expected });
     }
 
-    // Check 5: Make sure the token holds `SeImpersonatePrivilege`.
-    // Our entire elevation strategy relies on borrowing this token onto our own thread.
-    // If the token lacks this exact right, the Windows kernel will reject our upcoming
-    // `ImpersonateLoggedOnUser` call and crash the pipeline.
     let has_impersonate = token
         .has_privilege_present(Privilege::Impersonate)
         .map_err(|e| e.to_access_failure())?;
