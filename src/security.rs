@@ -13,7 +13,6 @@ pub use service::{Service, ServiceManager};
 pub use snapshot::ProcessSnapshot;
 pub use token::Token;
 
-/// Internal helper macro to eliminate repetitive Win32 result mapping boilerplate.
 macro_rules! win32 {
     ($func:ident ( $($arg:tt)* )) => {
         unsafe { $func($($arg)*) }.map_err(|source| $crate::error::ElevateError::Win32 {

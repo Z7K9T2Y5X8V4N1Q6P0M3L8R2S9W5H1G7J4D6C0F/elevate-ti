@@ -50,6 +50,7 @@ impl InteractiveDesktop {
         Self::Custom(path.into())
     }
 
+    /// Returns the raw Windows window station and desktop path representation.
     pub(crate) fn as_str(&self) -> &str {
         match self {
             Self::Default => "WinSta0\\Default",
@@ -196,6 +197,7 @@ impl Command {
     }
 }
 
+/// Expand Windows environment variables (e.g. `%SystemRoot%`) within a file path.
 fn expand_env_path(path: &Path) -> PathBuf {
     let input = HSTRING::from(path.as_os_str());
     let needed = unsafe { ExpandEnvironmentStringsW(&input, None) };

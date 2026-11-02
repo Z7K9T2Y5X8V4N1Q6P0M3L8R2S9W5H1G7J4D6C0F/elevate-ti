@@ -173,6 +173,11 @@ impl Elevator {
         Ok(ti_primary_token)
     }
 
+    /// Resolve an accessible Session 0 SYSTEM process PID to serve as the elevation pivot.
+    ///
+    /// Prioritizes the configured preferred process (e.g. `services.exe`) after verifying it resides
+    /// in the canonical System32 directory and holds genuine Session 0 SYSTEM privileges. If that fails,
+    /// falls back to scanning other running processes.
     fn resolve_system_process(&self) -> Result<u32, ElevateError> {
         let system32_path = get_system32_path()?;
 
@@ -282,6 +287,7 @@ impl Elevator {
     }
 }
 
+/// Resolve the target Windows Session ID according to the specified [`SessionTarget`] policy.
 fn resolve_session(token: &Token, session_target: &SessionTarget) -> Result<u32, ElevateError> {
     match session_target {
         SessionTarget::CallerSession => {
@@ -296,6 +302,7 @@ fn resolve_session(token: &Token, session_target: &SessionTarget) -> Result<u32,
     }
 }
 
+/// Enumerate all active Windows sessions and find an interactive session with a logged-on user.
 fn find_any_interactive_session() -> Result<u32, ElevateError> {
     let mut session_info_ptr: *mut WTS_SESSION_INFOW = std::ptr::null_mut();
     let mut count = 0u32;
@@ -379,6 +386,7 @@ fn has_logged_on_user(session_id: u32) -> Result<bool, ElevateError> {
     Ok(unsafe { *raw_ptr.0 != 0 })
 }
 
+/// Retrieve the canonical path to the Windows System32 directory (e.g. `C:\Windows\System32`).
 fn get_system32_path() -> Result<PathBuf, ElevateError> {
     let mut buf = [0u16; MAX_PATH as usize];
 
@@ -397,6 +405,7 @@ fn get_system32_path() -> Result<PathBuf, ElevateError> {
     Ok(wide_to_path(&buf[..char_count]))
 }
 
+/// Query the full executable image file path for a running process by its PID.
 fn get_process_image_path(pid: u32) -> Result<PathBuf, ElevateError> {
     let process = win32!(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid))?;
     let _guard = HandleGuard(process);
@@ -417,11 +426,13 @@ fn get_process_image_path(pid: u32) -> Result<PathBuf, ElevateError> {
     Ok(wide_to_path(&buf[..char_count as usize]))
 }
 
+/// Convert a slice of UTF-16 code units into a [`PathBuf`].
 #[inline]
 fn wide_to_path(wide: &[u16]) -> PathBuf {
     PathBuf::from(OsString::from_wide(wide))
 }
 
+/// Verify that the given executable path is located directly inside the System32 directory.
 fn is_in_system32(exe_path: &Path, system32_path: &Path) -> bool {
     exe_path
         .parent()
@@ -430,6 +441,8 @@ fn is_in_system32(exe_path: &Path, system32_path: &Path) -> bool {
         .is_some_and(|(parent, system32)| parent.eq_ignore_ascii_case(system32))
 }
 
+/// Validate that a token belongs to Local System (`S-1-5-18`), resides strictly in Session 0,
+/// is not restricted, and has system integrity and `SeImpersonatePrivilege`.
 fn verify_session0_system_token(token: &Token) -> Result<(), ProcessAccessFailure> {
     let sid = token.user_sid().map_err(|e| e.to_access_failure())?;
     if sid != LOCAL_SYSTEM_SID {

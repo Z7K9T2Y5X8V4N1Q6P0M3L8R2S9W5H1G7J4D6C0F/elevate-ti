@@ -104,9 +104,6 @@ impl Service {
             let mut status = SERVICE_STATUS_PROCESS::default();
             let mut bytes_needed = 0u32;
 
-            // SAFETY: SERVICE_STATUS_PROCESS is a plain-old-data (POD) struct composed entirely of DWORDs.
-            // Any byte pattern is valid, and casting it to a contiguous mutable byte slice covering its
-            // exact memory size is sound for the Windows API to populate.
             let status_bytes = unsafe {
                 slice::from_raw_parts_mut(
                     (&raw mut status).cast(),
@@ -124,15 +121,12 @@ impl Service {
             match status.dwCurrentState {
                 SERVICE_RUNNING => return Ok(status.dwProcessId),
                 SERVICE_STOPPED => match stopped_since {
-                    // Initial stopped state: trigger start and mark the beginning of the grace period.
                     None if !start_attempted => {
                         self.try_start()?;
                         start_attempted = true;
                         stopped_since = Some(Instant::now());
                     }
-                    // Within grace period: SCM may still be transitioning state. Keep checking.
                     Some(start_time) if start_time.elapsed() < STOPPED_GRACE => {}
-                    // Grace period expired or service stopped again after transitioning: failure confirmed.
                     _ => {
                         return Err(ElevateError::ServiceFailed {
                             name: self.name.clone(),
@@ -142,30 +136,22 @@ impl Service {
                     }
                 },
                 SERVICE_START_PENDING => {
-                    // SCM acknowledged startup; clear the stopped grace tracking.
                     stopped_since = None;
-
-                    // If checkpoint advances, the service is actively initializing; extend deadline.
                     if status.dwCheckPoint > 0 && status.dwCheckPoint > last_checkpoint {
                         last_checkpoint = status.dwCheckPoint;
                         deadline = Instant::now() + timeout;
                     }
                 }
 
-                // Intermediate states (e.g., STOP_PENDING): keep polling until timeout expires.
                 _ => {}
             }
 
-            // Polling interval:
-            // - During SCM state transition grace period: fast 250ms polling for prompt response.
-            // - During normal pending/running transition: MSDN-guided wait hint (1~3s).
             let target_interval = if stopped_since.is_some() {
                 GRACE_POLL
             } else {
                 Duration::from_millis((status.dwWaitHint / 10).clamp(1000, 3000) as u64)
             };
 
-            // Ensure sleep interval never overshoots the overall deadline.
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 continue;
@@ -174,6 +160,7 @@ impl Service {
         }
     }
 
+    /// Send a start control request to the service, tolerating if it is already running.
     fn try_start(&self) -> Result<(), ElevateError> {
         let result = win32!(StartServiceW(self.handle, None));
         match result {

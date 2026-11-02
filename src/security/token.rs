@@ -177,6 +177,10 @@ impl Token {
         }
     }
 
+    /// Query the mandatory integrity level RID of this security token.
+    ///
+    /// Retrieves the token's mandatory integrity label (`TokenIntegrityLevel`) and extracts
+    /// the last sub-authority of the integrity SID (e.g. `0x3000` for High, `0x4000` for System).
     pub(crate) fn integrity_level(&self) -> Result<u32, ElevateError> {
         let buf = self.query_info_buffer(TokenIntegrityLevel)?;
         let label: &TOKEN_MANDATORY_LABEL = Self::cast_buffer(&buf);
@@ -205,10 +209,13 @@ impl Token {
             return Err(ElevateError::InvalidSid);
         }
 
-        // SAFETY: `sub_auth_ptr` points to an aligned, readable 32-bit unsigned integer inside the valid SID.
         Ok(unsafe { *sub_auth_ptr })
     }
 
+    /// Check whether a specific privilege is held (present) on this security token.
+    ///
+    /// Note that this checks for the presence of the privilege in the token, regardless
+    /// of whether it is currently enabled (`SE_PRIVILEGE_ENABLED`) or disabled.
     pub(crate) fn has_privilege_present(&self, privilege: Privilege) -> Result<bool, ElevateError> {
         let mut luid = LUID::default();
         win32!(LookupPrivilegeValueW(
@@ -234,6 +241,7 @@ impl Token {
         Ok(slice.iter().any(|p| p.Luid == luid))
     }
 
+    /// Query the Windows Terminal Services (Remote Desktop) Session ID associated with this token.
     pub(crate) fn session_id(&self) -> Result<u32, ElevateError> {
         let mut session_id = 0u32;
         let mut bytes_needed = 0u32;
@@ -247,6 +255,9 @@ impl Token {
         Ok(session_id)
     }
 
+    /// Reassign the Windows Session ID of this token (`TokenSessionId`).
+    ///
+    /// Requires the caller to hold `SeTcbPrivilege` (typically obtained by impersonating SYSTEM).
     pub(crate) fn set_session_id(&self, session_id: u32) -> Result<(), ElevateError> {
         win32!(SetTokenInformation(
             self.0,
@@ -257,6 +268,9 @@ impl Token {
         Ok(())
     }
 
+    /// Execute a closure under the impersonated security context of this token.
+    ///
+    /// Reverts impersonation back to the original identity automatically when the closure returns or drops.
     pub(crate) fn with_impersonation<F, R>(&self, f: F) -> Result<R, ElevateError>
     where
         F: FnOnce() -> Result<R, ElevateError>,
@@ -272,6 +286,7 @@ impl Token {
         })
     }
 
+    /// Query the user account SID string (`TokenUser`) associated with this token.
     pub(crate) fn user_sid(&self) -> Result<String, ElevateError> {
         let buf = self.query_info_buffer(TokenUser)?;
         let user: &TOKEN_USER = Self::cast_buffer(&buf);
@@ -312,6 +327,7 @@ impl Token {
         Ok(false)
     }
 
+    /// Helper to query variable-length token information with automatic size probing and alignment.
     fn query_info_buffer(
         &self,
         class: TOKEN_INFORMATION_CLASS,
@@ -348,6 +364,7 @@ impl Token {
         Ok(buf)
     }
 
+    /// Cast an aligned usize buffer reference into the target token information struct reference.
     #[inline]
     fn cast_buffer<T>(buf: &[usize]) -> &T {
         debug_assert!(
@@ -359,6 +376,7 @@ impl Token {
     }
 }
 
+/// RAII scope guard ensuring impersonation is safely reverted back to the original caller on drop.
 pub(crate) struct ImpersonationGuard {
     _marker: PhantomData<*const ()>,
 }

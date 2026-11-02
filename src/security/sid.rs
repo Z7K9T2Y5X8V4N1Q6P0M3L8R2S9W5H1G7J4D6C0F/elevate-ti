@@ -40,26 +40,16 @@ impl Sid {
         self.0
     }
 
-    /// Check if two raw binary `PSID` handles represent the identical security principal.
+    /// Compare two raw binary `PSID` pointers for structural and content equality.
     ///
     /// # Safety
     ///
-    /// Both `lhs` and `rhs` must point to valid, readable memory representing SID structures,
-    /// and must remain valid and unmodified for the duration of this call (no concurrent writes).
-    ///
-    /// Note: Passing arbitrary invalid or dangling pointers will cause undefined behavior
-    /// (access violation), as [`IsValidSid`] cannot protect against unmapped memory.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ElevateError::InvalidSid`] if either pointer is null or fails
-    /// structural validation via [`IsValidSid`].
+    /// Both `lhs` and `rhs` must point to valid, readable memory containing binary SID structures.
     pub(crate) unsafe fn equal(lhs: PSID, rhs: PSID) -> Result<bool, ElevateError> {
         if lhs.0.is_null() || rhs.0.is_null() {
             return Err(ElevateError::InvalidSid);
         }
 
-        // Structural integrity validation: ensures SID revision and sub-authority counts are sane.
         if !unsafe { IsValidSid(lhs) }.as_bool() || !unsafe { IsValidSid(rhs) }.as_bool() {
             return Err(ElevateError::InvalidSid);
         }
@@ -71,8 +61,6 @@ impl Sid {
             return Ok(false);
         }
 
-        // Binary comparison: valid SIDs of identical length are identical iff their raw bytes match.
-        // This avoids legacy Win32 GetLastError ambiguity inherent to EqualSid.
         let bytes_lhs = unsafe { std::slice::from_raw_parts(lhs.0.cast::<u8>(), len_lhs as usize) };
         let bytes_rhs = unsafe { std::slice::from_raw_parts(rhs.0.cast::<u8>(), len_rhs as usize) };
 
@@ -84,8 +72,6 @@ impl Sid {
         let mut pwstr = PWSTR::null();
         win32!(ConvertSidToStringSidW(psid, &raw mut pwstr))?;
 
-        // Immediately wrap the returned buffer into an RAII guard to guarantee deallocation
-        // even if UTF-16 conversion fails or panics occur.
         let _guard = LocalFreeGuard(HLOCAL(pwstr.0.cast()));
 
         unsafe { pwstr.to_string() }.map_err(|_| ElevateError::InvalidSid)

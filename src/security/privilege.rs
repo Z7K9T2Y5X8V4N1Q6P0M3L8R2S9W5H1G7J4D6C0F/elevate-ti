@@ -12,6 +12,7 @@ pub enum Privilege {
 }
 
 impl Privilege {
+    /// Returns the wide string constant (`PCWSTR`) representation of the privilege name.
     pub(crate) const fn as_pcwstr(self) -> PCWSTR {
         match self {
             Self::Debug => w!("SeDebugPrivilege"),
@@ -19,6 +20,7 @@ impl Privilege {
         }
     }
 
+    /// Returns the UTF-8 string representation of the privilege name.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Debug => "SeDebugPrivilege",
