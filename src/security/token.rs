@@ -11,12 +11,13 @@ use windows::{
         Security::{
             AdjustTokenPrivileges, DuplicateTokenEx, GetSidSubAuthority, GetSidSubAuthorityCount,
             GetTokenInformation, ImpersonateLoggedOnUser, IsTokenRestricted, IsValidSid,
-            LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, RevertToSelf, SE_PRIVILEGE_ENABLED,
-            SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation, TOKEN_ACCESS_MASK,
-            TOKEN_ADJUST_PRIVILEGES, TOKEN_ALL_ACCESS, TOKEN_ELEVATION, TOKEN_GROUPS,
-            TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_PRIVILEGES, TOKEN_QUERY,
-            TOKEN_USER, TokenElevation, TokenGroups, TokenImpersonation, TokenIntegrityLevel,
-            TokenPrimary, TokenPrivileges, TokenSessionId, TokenUser,
+            IsWellKnownSid, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, RevertToSelf,
+            SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation,
+            TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_ALL_ACCESS, TOKEN_ELEVATION,
+            TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_PRIVILEGES,
+            TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenGroups, TokenImpersonation,
+            TokenIntegrityLevel, TokenPrimary, TokenPrivileges, TokenSessionId, TokenUser,
+            WELL_KNOWN_SID_TYPE,
         },
         System::{
             SystemServices::{MAXIMUM_ALLOWED, SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY},
@@ -362,6 +363,25 @@ impl Token {
         ))?;
 
         Ok(buf)
+    }
+
+    /// Checks whether the user SID associated with this token matches a specific well-known SID type.
+    ///
+    /// This bypasses string serialization and memory allocation by directly evaluating
+    /// the underlying binary `PSID` via the native Win32 `IsWellKnownSid` API.
+    pub(crate) fn is_well_known_user(
+        &self,
+        sid_type: WELL_KNOWN_SID_TYPE,
+    ) -> Result<bool, ElevateError> {
+        let buf = self.query_info_buffer(TokenUser)?;
+        let user: &TOKEN_USER = Self::cast_buffer(&buf);
+        let sid = user.User.Sid;
+
+        if sid.0.is_null() || !unsafe { IsValidSid(sid) }.as_bool() {
+            return Err(ElevateError::InvalidSid);
+        }
+
+        Ok(unsafe { IsWellKnownSid(sid, sid_type) }.as_bool())
     }
 
     /// Cast an aligned usize buffer reference into the target token information struct reference.

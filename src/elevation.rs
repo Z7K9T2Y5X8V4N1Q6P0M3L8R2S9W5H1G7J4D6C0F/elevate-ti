@@ -12,6 +12,7 @@ use std::{
 use windows::{
     Win32::{
         Foundation::MAX_PATH,
+        Security::WinLocalSystemSid,
         System::{
             RemoteDesktop::{
                 WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW, WTSActive, WTSEnumerateSessionsW,
@@ -40,7 +41,6 @@ use crate::{
     },
 };
 
-const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
 const DEFAULT_SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The canonical Session 0 SYSTEM process used as the elevation pivot.
@@ -441,11 +441,13 @@ fn is_in_system32(exe_path: &Path, system32_path: &Path) -> bool {
         .is_some_and(|(parent, system32)| parent.eq_ignore_ascii_case(system32))
 }
 
-/// Validate that a token belongs to Local System (`S-1-5-18`), resides strictly in Session 0,
-/// is not restricted, and has system integrity and `SeImpersonatePrivilege`.
+/// Verifies whether a candidate process token qualifies as a viable Session 0 SYSTEM elevation pivot.
 fn verify_session0_system_token(token: &Token) -> Result<(), ProcessAccessFailure> {
-    let sid = token.user_sid().map_err(|e| e.to_access_failure())?;
-    if sid != LOCAL_SYSTEM_SID {
+    let is_system_sid = token
+        .is_well_known_user(WinLocalSystemSid)
+        .map_err(|e| e.to_access_failure())?;
+    if !is_system_sid {
+        let sid = token.user_sid().map_err(|e| e.to_access_failure())?;
         return Err(ProcessAccessFailure::NotSystemSid { sid });
     }
 
@@ -589,27 +591,22 @@ mod tests {
         ));
     }
 
-    // Ensure `verify_session0_system_token` accepts only genuine Local System (S-1-5-18) tokens
+    // Ensure `verify_session0_system_token` accepts only genuine Local System (WinLocalSystemSid) tokens
     // residing strictly in Session 0, rejecting both non-system accounts and interactive system tokens.
-    //
-    // Context-dependent behavior:
-    // - Normal dev/CI running on an interactive desktop (Session >= 1) will fail fast with NotSystemSid.
-    // - If running as an interactive SYSTEM user (e.g. PsExec in Session 1+), it must fail with SessionMismatch.
-    // - If running directly as a Session 0 daemon/service, it must pass verification.
     #[test]
     fn verify_session0_system_token_rejects_non_system_or_non_session0_tokens() {
         let current_token = Token::current().unwrap();
-        let current_sid = current_token.user_sid().unwrap();
+        let is_system_sid = current_token.is_well_known_user(WinLocalSystemSid).unwrap();
         let current_session = current_token.session_id().unwrap();
 
         let result = verify_session0_system_token(&current_token);
 
-        if current_sid == LOCAL_SYSTEM_SID && current_session == 0 {
+        if is_system_sid && current_session == 0 {
             assert!(
                 result.is_ok(),
                 "Session 0 Local System token must be accepted"
             );
-        } else if current_sid != LOCAL_SYSTEM_SID {
+        } else if !is_system_sid {
             assert!(
                 matches!(result, Err(ProcessAccessFailure::NotSystemSid { .. })),
                 "Non-system token must be rejected with NotSystemSid"
