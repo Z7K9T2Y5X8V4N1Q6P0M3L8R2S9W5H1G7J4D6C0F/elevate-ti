@@ -172,17 +172,28 @@ impl Elevator {
         Ok(ti_primary_token)
     }
 
-    /// Resolves an accessible, unrestricted SYSTEM process in Session 0 via a two-stage scan.
+    /// Finds a usable, unrestricted SYSTEM process inside Session 0 using a two-stage scan.
+    ///
+    /// # The Search Strategy
+    /// - **Stage 1 (Primary Strategy)**: Target `services.exe` first. It runs 24/7, lives in Session 0,
+    ///   and Windows does not lock it down with `WinTCB` PPL armor.
+    /// - **Stage 2 (Fallback Strategy)**: If `services.exe` is blocked (e.g. by hyper-aggressive third-party
+    ///   antivirus hooks), scan all other accessible processes to find another valid Session 0 SYSTEM daemon.
     fn resolve_system_process(&self) -> Result<u32, ElevateError> {
         let system32_path = get_system32_path()?;
 
-        // Snapshot is collected into an owned vector to allow multiple iterations
-        // without consuming or attempting to clone non-cloneable Win32 handles.
+        // The Windows ToolHelp snapshot is a one-way street: once you iterate to the end,
+        // you cannot rewind it back to the start.
+        // We collect all processes into a `Vec` upfront so we can loop through them twice
+        // (Stage 1 for services.exe, and Stage 2 for the fallback scan).
         let processes: Vec<(u32, String)> = ProcessSnapshot::new()?.collect();
+        // Collects rejection reasons for failed candidates. If both stages fail,
+        // we print this full list so the user sees exactly why each process was rejected.
         let mut diagnostics = Vec::new();
+        // Tracks PIDs already inspected in Stage 1 to avoid wasting time checking them again in Stage 2.
         let mut checked_pids = HashSet::new();
 
-        // Stage 1: Inspect the single preferred system process (default: services.exe)
+        // Stage 1: Try the preferred target first (defaults to "services.exe").
         for &(pid, ref name) in &processes {
             if !name.eq_ignore_ascii_case(&self.preferred_system_process) {
                 continue;
@@ -190,6 +201,8 @@ impl Elevator {
 
             checked_pids.insert(pid);
 
+            // Step 1: Query the actual executable path on disk.
+            // If we can't even query the path (e.g. access denied), log why and move on.
             let image_path = match get_process_image_path(pid) {
                 Ok(path) => path,
                 Err(e) => {
@@ -201,7 +214,7 @@ impl Elevator {
                     continue;
                 }
             };
-
+            // Step 2: Path verification. Stop imposter processes running from C:\Temp\services.exe.
             if !is_in_system32(&image_path, &system32_path) {
                 diagnostics.push(ProcessDiagnostic {
                     pid,
@@ -211,6 +224,7 @@ impl Elevator {
                 continue;
             }
 
+            // Step 3: Open the process token.
             let token = match Token::from_pid(pid) {
                 Ok(token) => token,
                 Err(e) => {
@@ -223,6 +237,7 @@ impl Elevator {
                 }
             };
 
+            // Step 4: Run the 5-point safety check (Session 0, real SYSTEM SID, un-restricted, etc.).
             match verify_session0_system_token(&token) {
                 Ok(()) => return Ok(pid),
                 Err(reason) => {
@@ -235,14 +250,17 @@ impl Elevator {
             }
         }
 
-        // Stage 2: Fallback scan across all accessible Session 0 processes
+        // Stage 2: Fallback scan across all other running processes.
         let current_pid = std::process::id();
         for &(pid, ref name) in &processes {
+            // Skip:
+            // - PID 0 (System Idle) & PID 4 (System Kernel): You cannot open user-mode tokens for the kernel.
+            // - Current PID: We can't elevate by stealing from our own unprivileged self.
+            // - Already checked PIDs: Don't repeat work from Stage 1.
             if pid <= 4 || pid == current_pid || checked_pids.contains(&pid) {
                 continue;
             }
 
-            // Both stages enforce system32 physical path validation for defense-in-depth
             let exe_path = match get_process_image_path(pid) {
                 Ok(path) => path,
                 Err(e) => {
@@ -254,7 +272,6 @@ impl Elevator {
                     continue;
                 }
             };
-
             if !is_in_system32(&exe_path, &system32_path) {
                 continue;
             }
@@ -273,7 +290,13 @@ impl Elevator {
 
             match verify_session0_system_token(&token) {
                 Ok(()) => return Ok(pid),
+
+                // If a process is simply running under a normal user account or network service,
+                // that's totally expected during a full-system scan—don't pollute our error log with it.
                 Err(ProcessAccessFailure::NotSystemSid { .. }) => {}
+
+                // But if it IS a SYSTEM process and failed for another weird reason (e.g. restricted or demoted),
+                // log it in diagnostics so the user knows why it was rejected.
                 Err(reason) => {
                     diagnostics.push(ProcessDiagnostic {
                         pid,
@@ -284,6 +307,7 @@ impl Elevator {
             }
         }
 
+        // If both stages failed, return all collected diagnostics explaining why each candidate was rejected.
         Err(ElevateError::NoViableSystemProcess { diagnostics })
     }
 }
@@ -451,7 +475,25 @@ fn get_process_image_path(pid: u32) -> Result<PathBuf, ElevateError> {
     )))
 }
 
-/// Pure path verification: checks whether a binary is physically located in the System32 folder.
+/// Pure path verification: checks whether a binary lives directly inside the System32 folder.
+///
+/// # Why check the file path? Why not just trust the process name?
+/// Relying only on process names (like `"services.exe"`) is completely broken:
+/// Anyone can write a fake binary, name it `services.exe`, drop it in `C:\Temp\services.exe`,
+/// and run it. If our elevation code blindly trusted process names, we could accidentally
+/// hijack a malicious imposter process instead of the real Windows service!
+///
+/// Real Windows core services live strictly inside `%SystemRoot%\System32`, which is locked down
+/// by the OS and writable only by `TrustedInstaller`. Verifying the physical folder path guarantees
+/// we only steal tokens from genuine Windows system binaries.
+///
+/// # Why must it be a DIRECT child (`exe_path.parent()`)?
+/// We strictly require the parent directory to match `System32`:
+/// - **Allowed**: `C:\Windows\System32\services.exe` (parent is `System32`).
+/// - **Rejected**: `C:\Windows\System32\drivers\etc\fake.exe` (parent is `drivers\etc`, rejected!).
+/// - **Rejected**: `C:\Windows\explorer.exe` (outside `System32`, rejected!).
+///
+/// This stops someone from hiding an executable in writable subfolders inside the Windows directory.
 fn is_in_system32(exe_path: &Path, system32_path: &Path) -> bool {
     exe_path
         .parent()
@@ -460,45 +502,45 @@ fn is_in_system32(exe_path: &Path, system32_path: &Path) -> bool {
         .is_some_and(|(parent, system32)| parent.eq_ignore_ascii_case(system32))
 }
 
-/// Verifies whether an opened Token has full, unrestricted SYSTEM capabilities in Session 0.
+/// Checks if this token is a real, unrestricted SYSTEM token running in Session 0.
 ///
-/// # Why strictly Session 0?
-/// In modern Windows (Win10/11), processes running as `LocalSystem` (`S-1-5-18`) in interactive
-/// user sessions (Session 1+, such as `winlogon.exe`, `dwm.exe`, or `csrss.exe`) are hardened
-/// with high Protected Process Light levels (e.g. `PsProtectedSignerWinTcb-Light`).
-/// Attempting to access them fails early at `OpenProcess` with `0x00000005 (ACCESS_DENIED)`
-/// because the kernel enforces signer/protection level hierarchy checks before evaluating
-/// `SeDebugPrivilege`.
+/// # Why steal from Session 0 instead of `winlogon.exe`?
+/// You might see lazy elevation scripts on GitHub grab `winlogon.exe` in user sessions (Session 1+).
+/// On a standard, unhardened Home Edition PC, that often works because `winlogon.exe` runs as SYSTEM
+/// and isn't locked down by default.
 ///
-/// Furthermore, while an interactive SYSTEM token can theoretically be redirected via
-/// explicit `TokenSessionId` rewriting and `STARTUPINFO.lpDesktop` retargeting (requiring
-/// `SeTcbPrivilege`), pivoting through Session 0 core services (such as `services.exe`) is the
-/// most robust, lowest-friction engineering approach:
-/// - Session 0 daemons rarely opt into PPL, allowing standard `PROCESS_QUERY_INFORMATION` access.
-/// - Operating entirely within Session 0 decouples the elevation pipeline from user session
-///   lifecycles, enabling headless, background, and service execution without encountering
-///   cross-session window station or desktop namespace conflicts.
+/// But targeting `winlogon.exe` is a trap that blows up in real-world environments:
+/// 1. **PPL & Credential Guard**: In corporate networks, enterprise editions, or machines with
+///    Credential Guard enabled, Windows wraps interactive auth processes in PPL (Protected Process Light).
+///    When that happens, calling `OpenProcess` on `winlogon.exe` fails with `0x00000005 (ACCESS_DENIED)`—even
+///    if you are an Administrator holding `SeDebugPrivilege`.
+/// 2. **Headless / CI Disaster**: `winlogon.exe` only exists when someone is actually logged into
+///    a physical desktop! If your code runs inside a Windows background service, a scheduled task,
+///    or a headless CI/CD runner (like GitHub Actions), there is NO user desktop, and `winlogon.exe`
+///    won't even exist.
 ///
-/// # Why are these granular checks necessary?
-/// Even within Session 0, not every SYSTEM token can be used as an elevation pivot:
-/// 1. **Sandbox / Filtered Tokens**: Sandboxed workers or Defender components may run as
-///    SYSTEM but have their tokens filtered or restricted (`IsTokenRestricted`).
-/// 2. **Integrity Demotion**: Hardened services may be demoted below System integrity.
-/// 3. **Missing Privileges**: The pivot token must possess `SeImpersonatePrivilege` so that
-///    the caller can adopt it on an OS thread to inherit SYSTEM's full privilege set.
+/// That is why we strictly pivot through Session 0 (`services.exe`):
+/// - It is running 24/7 on every Windows machine, whether a monitor is plugged in or not.
+/// - It is not locked behind user-session PPL armor, making it work universally across Home, Pro,
+///   Enterprise, and headless server environments.
+///
+/// # Why 5 separate checks? (What happens if we skip them?)
+/// Just finding a token that says "SYSTEM" in Session 0 isn't enough. Without these checks:
+/// - We might steal a sandboxed Defender/Antivirus worker that has its permissions neutered.
+/// - We might steal a hardened service token whose integrity level was dropped down to standard user.
+/// - We might steal a token lacking impersonation rights, breaking our thread-stealing code later.
 fn verify_session0_system_token(token: &Token) -> Result<(), ProcessAccessFailure> {
-    // Stage 1: Identity verification.
-    // Ensure the token owner SID is strictly Local System (S-1-5-18).
-    // Filters out other service identities like LocalService (S-1-5-19) or NetworkService (S-1-5-20).
+    // Check 1: Make sure the token actually belongs to Local System ("S-1-5-18").
+    // If we skip this, we might accidentally grab a service running as "LocalService" (S-1-5-19)
+    // or "NetworkService" (S-1-5-20), which have nowhere near the power of true SYSTEM.
     let sid = token.user_sid().map_err(|e| e.to_access_failure())?;
     if sid != LOCAL_SYSTEM_SID {
         return Err(ProcessAccessFailure::NotSystemSid { sid });
     }
 
-    // Stage 2: Enforce Session 0 boundary.
-    // Core system services strictly reside in Session 0. Confining the pivot to Session 0
-    // avoids interactive PPL-hardened binaries (WinTCB) and ensures the pipeline works
-    // deterministically in both headless background tasks and user desktop launches.
+    // Check 2: Confirm this token actually lives in Session 0.
+    // If we accidentally grab a SYSTEM token from Session 1 (a logged-in desktop),
+    // our code will blow up the moment we try to use it in background environments or headless CI.
     let actual = token.session_id().map_err(|e| e.to_access_failure())?;
     if actual != 0 {
         return Err(ProcessAccessFailure::SessionMismatch {
@@ -507,27 +549,26 @@ fn verify_session0_system_token(token: &Token) -> Result<(), ProcessAccessFailur
         });
     }
 
-    // Stage 3: Filtered/Restricted token detection.
-    // Rejects restricted tokens where critical privileges are stripped or SIDs are demoted
-    // to deny-only, making them unsuitable as elevation pivots.
+    // Check 3: Check if Windows neutered this token (Restricted / Filtered token).
+    // Some background workers run as SYSTEM, but Windows flags their token as "Restricted"
+    // to lock them in a sandbox. A restricted token cannot be used to elevate anything.
     if token.is_restricted().map_err(|e| e.to_access_failure())? {
         return Err(ProcessAccessFailure::RestrictedToken);
     }
 
-    // Stage 4: Mandatory Integrity Level validation.
-    // Confirms the token operates at SYSTEM integrity (0x4000) or higher, protecting against
-    // integrity-demoted SYSTEM processes (e.g. hardened services explicitly lowered via
-    // integrity policy) or isolated sandbox workers.
+    // Check 4: Check the Integrity Level (must be SYSTEM altitude, 0x4000 or higher).
+    // Windows allows services to drop their own integrity down to Medium or Low to protect themselves.
+    // If we steal an integrity-demoted token, we won't have the permissions needed to hijack TrustedInstaller.
     let level = token.integrity_level().map_err(|e| e.to_access_failure())?;
     let expected = SECURITY_MANDATORY_SYSTEM_RID as u32;
     if level < expected {
         return Err(ProcessAccessFailure::LowIntegrityLevel { level, expected });
     }
 
-    // Stage 5: Impersonation capability verification.
-    // The elevation engine relies on impersonating this token on the current thread, thereby
-    // operating with SYSTEM's full privilege set (including SeTcbPrivilege) for downstream
-    // token operations. Without SeImpersonatePrivilege present, thread impersonation will fail.
+    // Check 5: Make sure the token holds `SeImpersonatePrivilege`.
+    // Our entire elevation strategy relies on borrowing this token onto our own thread.
+    // If the token lacks this exact right, the Windows kernel will reject our upcoming
+    // `ImpersonateLoggedOnUser` call and crash the pipeline.
     let has_impersonate = token
         .has_privilege_present(Privilege::Impersonate)
         .map_err(|e| e.to_access_failure())?;
