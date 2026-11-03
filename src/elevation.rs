@@ -62,6 +62,19 @@ pub enum SessionTarget {
     AnyInteractive,
 }
 
+/// Elevation execution audit report capturing real kernel-level pivot and session details.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElevationReport {
+    /// PID of the SYSTEM process actually utilized as the elevation pivot.
+    pub pivot_pid: u32,
+    /// Image name of the SYSTEM process actually utilized as the elevation pivot.
+    pub pivot_process_name: String,
+    /// Target Windows Session ID to which the token was successfully bound.
+    pub target_session: u32,
+    /// Process ID of the started `TrustedInstaller` service host.
+    pub trusted_installer_pid: u32,
+}
+
 /// Chained elevation engine utilizing SYSTEM tokens to acquire `TrustedInstaller`.
 pub struct Elevator {
     service_timeout: Duration,
@@ -124,7 +137,19 @@ impl Elevator {
         &self.context
     }
 
-    /// Execute elevation and return a fully elevated primary security token.
+    /// Returns the configured service startup timeout.
+    #[must_use]
+    pub const fn service_timeout(&self) -> Duration {
+        self.service_timeout
+    }
+
+    /// Returns a reference to the configured session target policy.
+    #[must_use]
+    pub const fn session_target(&self) -> &SessionTarget {
+        &self.session_target
+    }
+
+    /// Execute elevation and return a fully elevated primary security token containing provenance report.
     pub fn acquire_primary_token(&self) -> Result<Token, ElevateError> {
         let current_token = Token::current()?;
         if !current_token.is_elevated_admin()? {
@@ -146,41 +171,51 @@ impl Elevator {
 
         // Resolve an accessible SYSTEM process entirely from Session 0,
         // avoiding PPL locks on interactive winlogon.exe or lsass.exe.
-        let system_pid = self.resolve_system_process()?;
+        let (system_pid, system_name) = self.resolve_system_process()?;
         let system_token = Token::from_pid(system_pid)?.duplicate(TokenType::Impersonation)?;
 
         // Execute primary token duplication strictly within the bounded impersonation scope.
         // Impersonating SYSTEM grants SeTcbPrivilege, permitting explicit TokenSessionId reassignment.
-        let ti_primary_token = system_token.with_impersonation(|| {
+        let (ti_primary_token, actual_session) = system_token.with_impersonation(|| {
             let token = Token::from_pid(ti_pid)?.duplicate(TokenType::Primary)?;
 
-            if let Some(expected_session) = target_session {
+            let session = if let Some(expected_session) = target_session {
                 token.set_session_id(expected_session)?;
 
                 // Readback verification: ensure the session assignment took effect in kernel space
                 // and did not silently fail to prevent silent Session 0 window drop.
-                let actual_session = token.session_id()?;
-                if actual_session != expected_session {
+                let verified_session = token.session_id()?;
+                if verified_session != expected_session {
                     return Err(ElevateError::SessionBindingFailed {
                         expected: expected_session,
-                        actual: actual_session,
+                        actual: verified_session,
                     });
                 }
-            }
-            Ok(token)
+                verified_session
+            } else {
+                token.session_id()?
+            };
+
+            Ok((token, session))
         })?;
 
-        Ok(ti_primary_token)
+        let report = ElevationReport {
+            pivot_pid: system_pid,
+            pivot_process_name: system_name,
+            target_session: actual_session,
+            trusted_installer_pid: ti_pid,
+        };
+
+        Ok(ti_primary_token.with_report(report))
     }
 
-    /// Resolve an accessible Session 0 SYSTEM process PID to serve as the elevation pivot.
+    /// Resolve an accessible Session 0 SYSTEM process (PID and image name) to serve as the elevation pivot.
     ///
     /// Prioritizes the configured preferred process (e.g. `services.exe`) after verifying it resides
     /// in the canonical System32 directory and holds genuine Session 0 SYSTEM privileges. If that fails,
     /// falls back to scanning other running processes.
-    fn resolve_system_process(&self) -> Result<u32, ElevateError> {
+    fn resolve_system_process(&self) -> Result<(u32, String), ElevateError> {
         let system32_path = get_system32_path()?;
-
         let processes: Vec<_> = ProcessSnapshot::new()?.collect();
         let mut diagnostics = Vec::new();
         let mut checked_pids = HashSet::new();
@@ -226,7 +261,7 @@ impl Elevator {
             };
 
             match verify_session0_system_token(&token) {
-                Ok(()) => return Ok(pid),
+                Ok(()) => return Ok((pid, name.clone())),
                 Err(reason) => {
                     diagnostics.push(ProcessDiagnostic {
                         pid,
@@ -271,7 +306,7 @@ impl Elevator {
             };
 
             match verify_session0_system_token(&token) {
-                Ok(()) => return Ok(pid),
+                Ok(()) => return Ok((pid, name.clone())),
                 Err(ProcessAccessFailure::NotSystemSid { .. }) => {}
                 Err(reason) => {
                     diagnostics.push(ProcessDiagnostic {
@@ -407,14 +442,17 @@ fn get_system32_path() -> Result<PathBuf, ElevateError> {
 
 /// Query the full executable image file path for a running process by its PID.
 fn get_process_image_path(pid: u32) -> Result<PathBuf, ElevateError> {
-    let process = win32!(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid))?;
-    let _guard = HandleGuard(process);
+    let process = HandleGuard(win32!(OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION,
+        false,
+        pid
+    ))?);
 
     let mut buf = [0u16; 1024];
     let mut char_count = buf.len() as u32;
 
     win32!(QueryFullProcessImageNameW(
-        process,
+        process.0,
         PROCESS_NAME_FORMAT(0),
         PWSTR(buf.as_mut_ptr()),
         &raw mut char_count,
@@ -490,7 +528,6 @@ mod tests {
     const TRUSTED_INSTALLER_SID: PCWSTR =
         w!("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464");
 
-    // Helper: Ensure the current test runner has Administrator rights and SeDebugPrivilege.
     fn assert_elevated_context() {
         let current_token =
             Token::current().expect("Failed to open current process security token");
@@ -507,7 +544,6 @@ mod tests {
         );
     }
 
-    // Ensure the default configuration targets the active interactive user desktop.
     #[test]
     fn elevator_default_context_is_interactive_default() {
         assert_eq!(
@@ -516,7 +552,18 @@ mod tests {
         );
     }
 
-    // Ensure we can query the Windows System32 directory path (e.g. C:\Windows\System32) without failure.
+    #[test]
+    fn elevator_configuration_getters_reflect_parameters() {
+        let elevator = Elevator::default()
+            .with_service_timeout(Duration::from_secs(12))
+            .with_session_target(SessionTarget::Explicit(99))
+            .with_context(ExecutionContext::Headless);
+
+        assert_eq!(elevator.service_timeout(), Duration::from_secs(12));
+        assert_eq!(*elevator.session_target(), SessionTarget::Explicit(99));
+        assert_eq!(*elevator.context(), ExecutionContext::Headless);
+    }
+
     #[test]
     fn get_system32_path_locates_valid_system_directory() {
         let path = get_system32_path().expect("System32 directory path must be resolvable");
@@ -527,7 +574,6 @@ mod tests {
         );
     }
 
-    // Edge case: Querying invalid or non-existent PIDs (like PID 0 or PID max) should return a clean Win32 error, not crash.
     #[test]
     fn get_process_image_path_with_invalid_pids_returns_win32_error() {
         match get_process_image_path(0) {
@@ -545,7 +591,6 @@ mod tests {
         }
     }
 
-    // Ensure `get_process_image_path` can successfully retrieve the full executable path of a running process.
     #[test]
     fn get_process_image_path_returns_valid_path_for_current_process() {
         let system32_path = get_system32_path().unwrap();
@@ -554,19 +599,16 @@ mod tests {
         let path = get_process_image_path(current_pid)
             .expect("Should be able to query current process image path");
 
-        // A normal test binary lives in target\debug\..., so it should never be inside System32.
         assert!(
             !is_in_system32(&path, &system32_path),
             "The test binary ({path:?}) should not be located in System32"
         );
     }
 
-    // Verify that `is_in_system32` only returns true for files directly inside the System32 folder.
     #[test]
     fn is_in_system32_matches_only_direct_children() {
         let system32_path = Path::new(r"C:\Windows\System32");
 
-        // Files directly inside System32 should match (case-insensitive).
         assert!(is_in_system32(
             Path::new(r"C:\Windows\System32\services.exe"),
             system32_path
@@ -575,8 +617,6 @@ mod tests {
             Path::new(r"c:\windows\system32\svchost.exe"),
             system32_path
         ));
-
-        // Subdirectories, parent directories, or other drives should not match.
         assert!(!is_in_system32(
             Path::new(r"C:\Windows\System32\drivers\etc"),
             system32_path
@@ -591,8 +631,6 @@ mod tests {
         ));
     }
 
-    // Ensure `verify_session0_system_token` accepts only genuine Local System (WinLocalSystemSid) tokens
-    // residing strictly in Session 0, rejecting both non-system accounts and interactive system tokens.
     #[test]
     fn verify_session0_system_token_rejects_non_system_or_non_session0_tokens() {
         let current_token = Token::current().unwrap();
@@ -622,21 +660,16 @@ mod tests {
         }
     }
 
-    // Verify `resolve_session` correctly returns the current active desktop session ID,
-    // and strictly preserves explicitly provided session IDs.
     #[test]
     fn resolve_session_returns_active_or_explicit_session() {
         let current_token = Token::current().unwrap();
         let current_session = current_token.session_id().unwrap();
 
-        // 1. Explicit target: must strictly return whatever session ID was passed in.
         assert_eq!(
             resolve_session(&current_token, &SessionTarget::Explicit(42)).unwrap(),
             42
         );
 
-        // 2. CallerSession target: since this test runs in an interactive user session (Session >= 1),
-        // it must return the active session ID without errors.
         assert_eq!(
             resolve_session(&current_token, &SessionTarget::CallerSession).unwrap(),
             current_session
@@ -666,6 +699,11 @@ mod tests {
             session_id, 0,
             "Headless token must be strictly bound to Session 0"
         );
+
+        let report = token.report().expect("Token must contain elevation report");
+        assert_eq!(report.target_session, 0);
+        assert!(report.pivot_pid > 0);
+        assert_ne!(report.pivot_process_name, "");
     }
 
     // End-to-end test: Acquire a genuine TrustedInstaller token bound to the active user's desktop session.
@@ -692,5 +730,10 @@ mod tests {
             session_id, caller_session,
             "Interactive token must match the caller's active desktop session ID"
         );
+
+        let report = token.report().expect("Token must contain elevation report");
+        assert_eq!(report.target_session, caller_session);
+        assert!(report.pivot_pid > 0);
+        assert_ne!(report.pivot_process_name, "");
     }
 }

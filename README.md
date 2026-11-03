@@ -58,6 +58,7 @@ For complete and runnable scenarios, check the [`examples`](examples) directory:
 - [`relaunch.rs`](examples/relaunch.rs): Automatic self-elevation and privilege verification.
 - [`spawn.rs`](examples/spawn.rs): Spawning interactive processes onto user or secure desktops.
 - [`headless.rs`](examples/headless.rs): Non-interactive background execution in Session 0.
+- [`audit.rs`](examples/audit.rs): In-process token acquisition and kernel audit provenance reporting.
 
 ## License
 

@@ -288,8 +288,6 @@ mod tests {
     use super::*;
     use windows::{Win32::Foundation::E_INVALIDARG, core::HRESULT};
 
-    // Ensure Win32 E_ACCESSDENIED errors are specifically classified as AccessDenied
-    // so we can distinguish permission blocks (like PPL or EDR) during process scanning.
     #[test]
     fn to_access_failure_classifies_access_denied_error() {
         let err = ElevateError::Win32 {
@@ -304,7 +302,6 @@ mod tests {
         }
     }
 
-    // Ensure general Win32 errors (other than AccessDenied) are preserved as Win32Error with their HRESULT.
     #[test]
     fn to_access_failure_preserves_generic_win32_errors() {
         let err = ElevateError::Win32 {
@@ -319,7 +316,6 @@ mod tests {
         }
     }
 
-    // Ensure custom crate errors (like AdministratorRequired) convert cleanly into an InternalError string.
     #[test]
     fn to_access_failure_converts_domain_errors_to_internal_error() {
         let err = ElevateError::AdministratorRequired;
@@ -331,7 +327,6 @@ mod tests {
         }
     }
 
-    // Ensure standard I/O errors are safely formatted and preserved inside an InternalError.
     #[test]
     fn to_access_failure_converts_io_errors_to_internal_error() {
         let err = ElevateError::Io(io::Error::new(io::ErrorKind::NotFound, "file not found"));
