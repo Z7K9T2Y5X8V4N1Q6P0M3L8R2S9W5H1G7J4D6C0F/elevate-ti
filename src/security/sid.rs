@@ -71,9 +71,8 @@ impl Sid {
     pub(crate) fn string_from_raw(psid: PSID) -> Result<String, ElevateError> {
         let mut pwstr = PWSTR::null();
         win32!(ConvertSidToStringSidW(psid, &raw mut pwstr))?;
-
         let _guard = LocalFreeGuard(HLOCAL(pwstr.0.cast()));
 
-        unsafe { pwstr.to_string() }.map_err(|_| ElevateError::InvalidSid)
+        Ok(String::from_utf16_lossy(unsafe { pwstr.as_wide() }))
     }
 }
