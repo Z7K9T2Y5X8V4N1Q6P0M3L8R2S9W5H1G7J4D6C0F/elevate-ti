@@ -146,7 +146,7 @@ impl Command {
         let mut env_block: *mut c_void = ptr::null_mut();
         win32!(CreateEnvironmentBlock(
             &raw mut env_block,
-            self.token.as_raw(),
+            Some(self.token.as_raw()),
             false
         ))?;
         let _guard = EnvBlockGuard(env_block);
@@ -181,7 +181,7 @@ impl Command {
             self.token.as_raw(),
             CREATE_PROCESS_LOGON_FLAGS(0),
             program_path,
-            PWSTR(cmd_line.as_mut_ptr()),
+            Some(PWSTR(cmd_line.as_mut_ptr())),
             CREATE_UNICODE_ENVIRONMENT,
             Some(env_block),
             &cwd,

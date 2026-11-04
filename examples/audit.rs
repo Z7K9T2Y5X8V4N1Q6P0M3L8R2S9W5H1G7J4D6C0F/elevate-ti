@@ -14,10 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read and print the verified kernel-level audit report
     if let Some(report) = token.report() {
         println!("\n================ Elevation Audit Report ================");
-        println!(
-            "* TrustedInstaller Service PID : {}",
-            report.trusted_installer_pid
-        );
+        println!("* TrustedInstaller Service PID : {}", report.ti_pid);
         println!(
             "* SYSTEM Pivot Process         : {} (PID: {})",
             report.pivot_process_name, report.pivot_pid

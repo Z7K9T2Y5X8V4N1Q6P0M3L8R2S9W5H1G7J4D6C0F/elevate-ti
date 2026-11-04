@@ -21,7 +21,7 @@ impl Drop for Sid {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
             unsafe {
-                let _ = LocalFree(HLOCAL(self.0.0));
+                let _ = LocalFree(Some(HLOCAL(self.0.0)));
             }
         }
     }

@@ -1,6 +1,6 @@
 [package]
 name = "elevate-ti"
-version = "0.17.6"
+version = "0.18.0"
 edition = "2024"
 description = "A safe, idiomatic Rust library to obtain Windows TrustedInstaller privileges"
 readme = "README.md"
@@ -16,26 +16,14 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-thiserror = "2.0"
+thiserror = "2.0.21"
 
 [dependencies.windows]
-version = "0.58"
-features = [
-  "Win32_Foundation",
-  "Win32_Security",
-  "Win32_Security_Authorization",
-  "Win32_System_Diagnostics_ToolHelp",
-  "Win32_System_Environment",
-  "Win32_System_RemoteDesktop",
-  "Win32_System_Services",
-  "Win32_System_SystemInformation",
-  "Win32_System_SystemServices",
-  "Win32_System_Threading",
-  "Win32_UI_WindowsAndMessaging",
-]
+version = "0.62.2"
+features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Environment", "Win32_System_RemoteDesktop", "Win32_System_Services", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"]
 
 [dev-dependencies]
-static_assertions = "1.1"
+static_assertions = "1.1.0"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }

@@ -9,9 +9,9 @@ pub(crate) mod snapshot;
 pub(crate) mod token;
 
 pub use command::{Command, ExecutionContext, InteractiveDesktop};
-pub use service::{Service, ServiceManager};
-pub use snapshot::ProcessSnapshot;
-pub use token::Token;
+pub(crate) use service::ServiceManager;
+pub(crate) use snapshot::ProcessSnapshot;
+pub(crate) use token::Token;
 
 macro_rules! win32 {
     ($func:ident ( $($arg:tt)* )) => {

@@ -359,7 +359,7 @@ impl Token {
             if last_error != ERROR_INSUFFICIENT_BUFFER {
                 return Err(ElevateError::Win32 {
                     operation: "GetTokenInformation (probe size)",
-                    source: windows::core::Error::from_win32(),
+                    source: windows::core::Error::from_hresult(last_error.to_hresult()),
                 });
             }
         }
@@ -369,7 +369,7 @@ impl Token {
         }
 
         let count = (bytes_needed as usize).div_ceil(mem::size_of::<usize>());
-        let mut buf: Vec<usize> = vec![0; count];
+        let mut buf = vec![0; count];
 
         win32!(GetTokenInformation(
             self.handle,

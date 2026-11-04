@@ -72,7 +72,7 @@ pub struct ElevationReport {
     /// Target Windows Session ID to which the token was successfully bound.
     pub target_session: u32,
     /// Process ID of the started `TrustedInstaller` service host.
-    pub trusted_installer_pid: u32,
+    pub ti_pid: u32,
 }
 
 /// Chained elevation engine utilizing SYSTEM tokens to acquire `TrustedInstaller`.
@@ -203,7 +203,7 @@ impl Elevator {
             pivot_pid: system_pid,
             pivot_process_name: system_name,
             target_session: actual_session,
-            trusted_installer_pid: ti_pid,
+            ti_pid,
         };
 
         Ok(ti_primary_token.with_report(report))
@@ -211,20 +211,22 @@ impl Elevator {
 
     /// Resolve an accessible Session 0 SYSTEM process (PID and image name) to serve as the elevation pivot.
     ///
-    /// Prioritizes the configured preferred process (e.g. `services.exe`) after verifying it resides
-    /// in the canonical System32 directory and holds genuine Session 0 SYSTEM privileges. If that fails,
-    /// falls back to scanning other running processes.
+    /// Prioritizes the configured preferred process (e.g. `services.exe`) via zero-copy name comparisons
+    /// after verifying it resides in the canonical System32 directory and holds genuine Session 0 SYSTEM
+    /// privileges. If that fails, falls back to scanning other running processes.
     fn resolve_system_process(&self) -> Result<(u32, String), ElevateError> {
         let system32_path = get_system32_path()?;
-        let processes: Vec<_> = ProcessSnapshot::new()?.collect();
         let mut diagnostics = Vec::new();
         let mut checked_pids = HashSet::new();
 
-        for &(pid, ref name) in &processes {
-            if !name.eq_ignore_ascii_case(&self.preferred_system_process) {
+        // Pass 1: Prioritize the preferred SYSTEM process (zero-allocation string filtering)
+        let mut snapshot = ProcessSnapshot::new()?;
+        while let Some(proc) = snapshot.next_entry() {
+            if !proc.eq_ignore_ascii_case(&self.preferred_system_process) {
                 continue;
             }
 
+            let pid = proc.pid;
             checked_pids.insert(pid);
 
             let image_path = match get_process_image_path(pid) {
@@ -232,7 +234,7 @@ impl Elevator {
                 Err(e) => {
                     diagnostics.push(ProcessDiagnostic {
                         pid,
-                        name: name.clone(),
+                        name: proc.to_string_lossy(),
                         reason: e.to_access_failure(),
                     });
                     continue;
@@ -242,7 +244,7 @@ impl Elevator {
             if !is_in_system32(&image_path, &system32_path) {
                 diagnostics.push(ProcessDiagnostic {
                     pid,
-                    name: name.clone(),
+                    name: proc.to_string_lossy(),
                     reason: ProcessAccessFailure::NotInSystem32,
                 });
                 continue;
@@ -253,7 +255,7 @@ impl Elevator {
                 Err(e) => {
                     diagnostics.push(ProcessDiagnostic {
                         pid,
-                        name: name.clone(),
+                        name: proc.to_string_lossy(),
                         reason: e.to_access_failure(),
                     });
                     continue;
@@ -261,19 +263,22 @@ impl Elevator {
             };
 
             match verify_session0_system_token(&token) {
-                Ok(()) => return Ok((pid, name.clone())),
+                Ok(()) => return Ok((pid, proc.to_string_lossy())),
                 Err(reason) => {
                     diagnostics.push(ProcessDiagnostic {
                         pid,
-                        name: name.clone(),
+                        name: proc.to_string_lossy(),
                         reason,
                     });
                 }
             }
         }
 
+        // Pass 2: Fallback scan across all other running processes
         let current_pid = std::process::id();
-        for &(pid, ref name) in &processes {
+        let mut fallback_snapshot = ProcessSnapshot::new()?;
+        while let Some(proc) = fallback_snapshot.next_entry() {
+            let pid = proc.pid;
             if pid <= 4 || pid == current_pid || checked_pids.contains(&pid) {
                 continue;
             }
@@ -283,7 +288,7 @@ impl Elevator {
                 Err(e) => {
                     diagnostics.push(ProcessDiagnostic {
                         pid,
-                        name: name.clone(),
+                        name: proc.to_string_lossy(),
                         reason: e.to_access_failure(),
                     });
                     continue;
@@ -298,7 +303,7 @@ impl Elevator {
                 Err(e) => {
                     diagnostics.push(ProcessDiagnostic {
                         pid,
-                        name: name.clone(),
+                        name: proc.to_string_lossy(),
                         reason: e.to_access_failure(),
                     });
                     continue;
@@ -306,12 +311,12 @@ impl Elevator {
             };
 
             match verify_session0_system_token(&token) {
-                Ok(()) => return Ok((pid, name.clone())),
+                Ok(()) => return Ok((pid, proc.to_string_lossy())),
                 Err(ProcessAccessFailure::NotSystemSid { .. }) => {}
                 Err(reason) => {
                     diagnostics.push(ProcessDiagnostic {
                         pid,
-                        name: name.clone(),
+                        name: proc.to_string_lossy(),
                         reason,
                     });
                 }
@@ -343,7 +348,7 @@ fn find_any_interactive_session() -> Result<u32, ElevateError> {
     let mut count = 0u32;
 
     win32!(WTSEnumerateSessionsW(
-        WTS_CURRENT_SERVER_HANDLE,
+        Some(WTS_CURRENT_SERVER_HANDLE),
         0,
         1,
         &raw mut session_info_ptr,
@@ -405,7 +410,7 @@ fn has_logged_on_user(session_id: u32) -> Result<bool, ElevateError> {
     let mut bytes_returned = 0u32;
 
     win32!(WTSQuerySessionInformationW(
-        WTS_CURRENT_SERVER_HANDLE,
+        Some(WTS_CURRENT_SERVER_HANDLE),
         session_id,
         WTSUserName,
         &raw mut raw_ptr,
@@ -712,7 +717,7 @@ mod tests {
     fn acquire_primary_token_interactive_binds_to_caller_session() {
         assert_elevated_context();
 
-        let elevator = Elevator::default(); // Defaults to Interactive desktop
+        let elevator = Elevator::default();
         let token = elevator
             .acquire_primary_token()
             .expect("Failed to acquire TrustedInstaller token for interactive session");

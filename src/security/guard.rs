@@ -48,7 +48,7 @@ impl Drop for LocalFreeGuard {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
             unsafe {
-                let _ = LocalFree(self.0);
+                let _ = LocalFree(Some(self.0));
             }
         }
     }
