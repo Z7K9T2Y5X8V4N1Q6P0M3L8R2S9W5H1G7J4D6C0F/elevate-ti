@@ -137,6 +137,8 @@ impl Service {
                 },
                 SERVICE_START_PENDING => {
                     stopped_since = None;
+                    // The service is making progress, so reset the wait hint.
+                    // REF: https://learn.microsoft.com/en-us/windows/win32/services/starting-a-service
                     if status.dwCheckPoint > 0 && status.dwCheckPoint > last_checkpoint {
                         last_checkpoint = status.dwCheckPoint;
                         deadline = Instant::now() + timeout;
@@ -149,6 +151,9 @@ impl Service {
             let target_interval = if stopped_since.is_some() {
                 GRACE_POLL
             } else {
+                // "A good interval is one-tenth the wait hint, but no less than 1 second and no more than 10 seconds."
+                // NOTE: Upper bound is capped at 3s instead of 10s for faster responsiveness.
+                // REF: https://learn.microsoft.com/en-us/windows/win32/services/starting-a-service
                 Duration::from_millis((status.dwWaitHint / 10).clamp(1000, 3000) as u64)
             };
 

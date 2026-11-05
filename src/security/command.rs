@@ -95,9 +95,11 @@ impl Command {
     pub fn headless(program: impl AsRef<Path>) -> Result<Self, ElevateError> {
         let elevator = Elevator::new(ExecutionContext::Headless);
         let token = elevator.acquire_primary_token()?;
+        let program = Some(expand_env_path(program.as_ref()));
+
         Ok(Self {
             token,
-            program: Some(expand_env_path(program.as_ref())),
+            program,
             args: None,
             desktop: None,
         })
@@ -110,10 +112,12 @@ impl Command {
     ) -> Result<Self, ElevateError> {
         let elevator = Elevator::new(ExecutionContext::Interactive(desktop.clone()));
         let token = elevator.acquire_primary_token()?;
+        let program = Some(expand_env_path(program.as_ref()));
         let desktop = Some(HSTRING::from(desktop.as_str()));
+
         Ok(Self {
             token,
-            program: Some(expand_env_path(program.as_ref())),
+            program,
             args: None,
             desktop,
         })
@@ -121,8 +125,7 @@ impl Command {
 
     /// Relaunch the current running binary with `TrustedInstaller` privileges.
     pub fn relaunch() -> Result<(), ElevateError> {
-        let current = env::current_exe()?;
-        Self::new(current)?.spawn()
+        Self::new(env::current_exe()?)?.spawn()
     }
 
     /// Pass a raw command-line string to the process.
@@ -136,12 +139,18 @@ impl Command {
 
     /// Spawn the elevated process.
     pub fn spawn(self) -> Result<(), ElevateError> {
-        let cmd_line = match (&self.program, &self.args) {
-            (_program, Some(args)) => args.clone(),
-            (Some(program), None) => format!("\"{}\"", program.display()),
-            (None, None) => return Err(ElevateError::MissingExePath),
+        let program = self.program.as_ref().ok_or(ElevateError::MissingExePath)?;
+        // Form standard Windows lpCommandLine: "\"<program>\" <args...>"
+        // "because argv[0] is the unit name, C runtimes typically repeat the module name as the first token in the command line."
+        // Passing lpApplicationName guarantees binary resolution, while repeating it as the first token in lpCommandLine
+        // ensures standard C-runtime argv[0] alignment for the child process.
+        // REF: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw
+        let cmd_line = match &self.args {
+            Some(args) => format!("\"{}\" {args}", program.display()),
+            None => format!("\"{}\"", program.display()),
         };
         let mut cmd_line: Vec<u16> = cmd_line.encode_utf16().chain(std::iter::once(0)).collect();
+        let cmd_line = Some(PWSTR(cmd_line.as_mut_ptr()));
 
         let mut env_block: *mut c_void = ptr::null_mut();
         win32!(CreateEnvironmentBlock(
@@ -168,20 +177,14 @@ impl Command {
         };
         let mut process_info = PROCESS_INFORMATION::default();
 
-        let program = self
-            .program
-            .as_ref()
-            .map(|path| HSTRING::from(path.as_os_str()));
-        let program_path = match &program {
-            Some(program_path) => PCWSTR(program_path.as_ptr()),
-            None => PCWSTR::null(),
-        };
+        let program_path = HSTRING::from(program.as_os_str());
+        let program_path = PCWSTR(program_path.as_ptr());
 
         let spawn_result = win32!(CreateProcessWithTokenW(
             self.token.as_raw(),
             CREATE_PROCESS_LOGON_FLAGS(0),
             program_path,
-            Some(PWSTR(cmd_line.as_mut_ptr())),
+            cmd_line,
             CREATE_UNICODE_ENVIRONMENT,
             Some(env_block),
             &cwd,
@@ -207,6 +210,9 @@ fn expand_env_path(path: &Path) -> PathBuf {
 
     let mut buf: Vec<u16> = vec![0; needed as usize];
     let written = unsafe { ExpandEnvironmentStringsW(&input, Some(&mut buf)) };
+    // "If the destination buffer is too small to hold the expanded string, the return value is the required buffer size"
+    // Handle race condition where an environment variable was enlarged between probe and expansion.
+    // REF: https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-expandenvironmentstringsw
     if written == 0 || written as usize > buf.len() {
         return path.to_path_buf();
     }
