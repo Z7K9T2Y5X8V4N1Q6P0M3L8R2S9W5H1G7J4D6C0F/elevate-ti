@@ -78,6 +78,7 @@ impl Default for ExecutionContext {
 
 /// A process builder for executing commands with `TrustedInstaller` privileges.
 #[must_use = "commands do nothing unless spawned"]
+#[derive(Debug)]
 pub struct Command {
     token: Token,
     program: Option<PathBuf>,

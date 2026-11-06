@@ -11,7 +11,7 @@ use std::{
 
 use windows::{
     Win32::{
-        Foundation::MAX_PATH,
+        Foundation::{HANDLE, MAX_PATH},
         Security::WinLocalSystemSid,
         Storage::FileSystem::{
             CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_SHARE_READ,
@@ -25,8 +25,8 @@ use windows::{
             SystemInformation::GetSystemDirectoryW,
             SystemServices::SECURITY_MANDATORY_SYSTEM_RID,
             Threading::{
-                OpenProcess, PROCESS_NAME_NATIVE, PROCESS_QUERY_LIMITED_INFORMATION,
-                QueryFullProcessImageNameW,
+                OpenProcess, PROCESS_NAME_NATIVE, PROCESS_QUERY_INFORMATION,
+                PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
             },
         },
     },
@@ -79,7 +79,16 @@ pub struct ElevationReport {
     pub ti_pid: u32,
 }
 
+/// Resolved SYSTEM elevation pivot details holding the pre-acquired token to prevent PID reuse.
+#[derive(Debug)]
+struct SystemPivot {
+    pid: u32,
+    name: String,
+    token: Token,
+}
+
 /// Chained elevation engine utilizing SYSTEM tokens to acquire `TrustedInstaller`.
+#[derive(Debug)]
 pub struct Elevator {
     service_timeout: Duration,
     context: ExecutionContext,
@@ -175,8 +184,9 @@ impl Elevator {
 
         // Resolve an accessible SYSTEM process entirely from Session 0,
         // avoiding PPL locks on interactive winlogon.exe or lsass.exe.
-        let (system_pid, system_name) = self.resolve_system_process()?;
-        let system_token = Token::from_pid(system_pid)?.duplicate(TokenType::Impersonation)?;
+        // The token is acquired directly from the verified process handle to prevent TOCTOU PID reuse.
+        let pivot = self.resolve_system_process()?;
+        let system_token = pivot.token.duplicate(TokenType::Impersonation)?;
 
         // Execute primary token duplication strictly within the bounded impersonation scope.
         // Impersonating SYSTEM grants SeTcbPrivilege, permitting explicit TokenSessionId reassignment.
@@ -204,8 +214,8 @@ impl Elevator {
         })?;
 
         let report = ElevationReport {
-            pivot_pid: system_pid,
-            pivot_process_name: system_name,
+            pivot_pid: pivot.pid,
+            pivot_process_name: pivot.name,
             target_session: actual_session,
             ti_pid,
         };
@@ -213,13 +223,11 @@ impl Elevator {
         Ok(ti_primary_token.with_report(report))
     }
 
-    /// Resolve an accessible Session 0 SYSTEM process (PID and image name) to serve as the elevation pivot.
+    /// Resolve an accessible Session 0 SYSTEM process to serve as the elevation pivot.
     ///
-    /// Prioritizes the configured preferred process (e.g. `services.exe`) via zero-copy name comparisons
-    /// after verifying its binary physically resides in the canonical System32 directory via kernel-level
-    /// NT device path normalization and holds genuine Session 0 SYSTEM privileges. If that fails, falls back
-    /// to scanning other running processes.
-    fn resolve_system_process(&self) -> Result<(u32, String), ElevateError> {
+    /// Pins the candidate process via an active handle during image path verification and token
+    /// extraction, immunizing the elevation pipeline against TOCTOU PID recycling attacks.
+    fn resolve_system_process(&self) -> Result<SystemPivot, ElevateError> {
         let system32_native_path = get_canonical_system32_native_path()?;
         let mut diagnostics = Vec::new();
         let mut checked_pids = HashSet::new();
@@ -234,41 +242,14 @@ impl Elevator {
             let pid = proc.pid;
             checked_pids.insert(pid);
 
-            let image_native_path = match get_process_image_native_path(pid) {
-                Ok(path) => path,
-                Err(e) => {
-                    diagnostics.push(ProcessDiagnostic {
+            match inspect_candidate_process(pid, &system32_native_path) {
+                Ok(token) => {
+                    return Ok(SystemPivot {
                         pid,
                         name: proc.to_string_lossy(),
-                        reason: e.to_access_failure(),
+                        token,
                     });
-                    continue;
                 }
-            };
-
-            if !is_in_system32(&image_native_path, &system32_native_path) {
-                diagnostics.push(ProcessDiagnostic {
-                    pid,
-                    name: proc.to_string_lossy(),
-                    reason: ProcessAccessFailure::NotInSystem32,
-                });
-                continue;
-            }
-
-            let token = match Token::from_pid(pid) {
-                Ok(token) => token,
-                Err(e) => {
-                    diagnostics.push(ProcessDiagnostic {
-                        pid,
-                        name: proc.to_string_lossy(),
-                        reason: e.to_access_failure(),
-                    });
-                    continue;
-                }
-            };
-
-            match verify_session0_system_token(&token) {
-                Ok(()) => return Ok((pid, proc.to_string_lossy())),
                 Err(reason) => {
                     diagnostics.push(ProcessDiagnostic {
                         pid,
@@ -288,36 +269,19 @@ impl Elevator {
                 continue;
             }
 
-            let image_native_path = match get_process_image_native_path(pid) {
-                Ok(path) => path,
-                Err(e) => {
-                    diagnostics.push(ProcessDiagnostic {
+            match inspect_candidate_process(pid, &system32_native_path) {
+                Ok(token) => {
+                    return Ok(SystemPivot {
                         pid,
                         name: proc.to_string_lossy(),
-                        reason: e.to_access_failure(),
+                        token,
                     });
-                    continue;
                 }
-            };
-            if !is_in_system32(&image_native_path, &system32_native_path) {
-                continue;
-            }
-
-            let token = match Token::from_pid(pid) {
-                Ok(token) => token,
-                Err(e) => {
-                    diagnostics.push(ProcessDiagnostic {
-                        pid,
-                        name: proc.to_string_lossy(),
-                        reason: e.to_access_failure(),
-                    });
-                    continue;
+                Err(
+                    ProcessAccessFailure::NotSystemSid { .. } | ProcessAccessFailure::NotInSystem32,
+                ) => {
+                    // Suppress normal non-target process rejections to avoid noisy fallback diagnostics
                 }
-            };
-
-            match verify_session0_system_token(&token) {
-                Ok(()) => return Ok((pid, proc.to_string_lossy())),
-                Err(ProcessAccessFailure::NotSystemSid { .. }) => {}
                 Err(reason) => {
                     diagnostics.push(ProcessDiagnostic {
                         pid,
@@ -330,6 +294,36 @@ impl Elevator {
 
         Err(ElevateError::NoViableSystemProcess { diagnostics })
     }
+}
+
+/// Inspect a candidate process atomically using a pinned handle, verifying image path and token qualifications.
+fn inspect_candidate_process(
+    pid: u32,
+    system32_native_path: &Path,
+) -> Result<Token, ProcessAccessFailure> {
+    // Pin the process by opening it once with both image query and token query access rights.
+    // As long as this handle remains open, the kernel preserves the underlying EPROCESS structure,
+    // making PID reuse physically impossible during the entire inspection and token extraction.
+    let process = HandleGuard(
+        win32!(OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_QUERY_INFORMATION,
+            false,
+            pid
+        ))
+        .map_err(|e| e.to_access_failure())?,
+    );
+
+    let image_native_path =
+        get_process_image_native_path_from_handle(process.0).map_err(|e| e.to_access_failure())?;
+
+    if !is_in_system32(&image_native_path, system32_native_path) {
+        return Err(ProcessAccessFailure::NotInSystem32);
+    }
+
+    let token = Token::from_process_handle(process.0).map_err(|e| e.to_access_failure())?;
+    verify_session0_system_token(&token)?;
+
+    Ok(token)
 }
 
 /// Resolve the target Windows Session ID according to the specified [`SessionTarget`] policy.
@@ -489,22 +483,18 @@ pub(crate) fn get_canonical_system32_native_path() -> Result<PathBuf, ElevateErr
     Ok(wide_to_path(&buf[..char_count]))
 }
 
-/// Query the native NT device path of a running process image (e.g. `\Device\HarddiskVolume3\Windows\System32\services.exe`).
+/// Query the native NT device path of a running process image from an already open process handle.
 ///
 /// Uses `PROCESS_NAME_NATIVE` to completely bypass DOS drive letter substitutions (`subst`),
 /// junction points, and user-space symlink redirection.
-pub(crate) fn get_process_image_native_path(pid: u32) -> Result<PathBuf, ElevateError> {
-    let process = HandleGuard(win32!(OpenProcess(
-        PROCESS_QUERY_LIMITED_INFORMATION,
-        false,
-        pid
-    ))?);
-
+pub(crate) fn get_process_image_native_path_from_handle(
+    process_handle: HANDLE,
+) -> Result<PathBuf, ElevateError> {
     let mut buf = [0u16; 1024];
     let mut char_count = buf.len() as u32;
 
     win32!(QueryFullProcessImageNameW(
-        process.0,
+        process_handle,
         PROCESS_NAME_NATIVE,
         PWSTR(buf.as_mut_ptr()),
         &raw mut char_count,
@@ -639,40 +629,32 @@ mod tests {
         );
     }
 
+    /// Verifies that `inspect_candidate_process` correctly opens a real running process
+    /// but strictly rejects it because its binary does not reside in System32.
     #[test]
-    fn get_process_image_native_path_with_invalid_pids_returns_win32_error() {
-        match get_process_image_native_path(0) {
-            Err(ElevateError::Win32 { operation, .. }) => {
-                assert_eq!(operation, "OpenProcess");
-            }
-            other => panic!("Expected Win32 OpenProcess error for PID 0, got: {other:?}"),
-        }
-
-        match get_process_image_native_path(u32::MAX - 1) {
-            Err(ElevateError::Win32 { operation, .. }) => {
-                assert_eq!(operation, "OpenProcess");
-            }
-            other => panic!("Expected Win32 OpenProcess error for bogus PID, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn get_process_image_native_path_returns_valid_nt_path_for_current_process() {
-        let system32_native_path = get_canonical_system32_native_path().unwrap();
+    fn inspect_candidate_process_rejects_current_non_system32_process() {
+        let system32_native_path = get_canonical_system32_native_path()
+            .expect("System32 canonical NT path must be resolvable");
         let current_pid = std::process::id();
 
-        let path = get_process_image_native_path(current_pid)
-            .expect("Should be able to query current process native image path");
+        let result = inspect_candidate_process(current_pid, &system32_native_path);
 
         assert!(
-            path.to_string_lossy().starts_with(r"\Device\"),
-            "Native path must start with '\\Device\\', got: {path:?}"
+            matches!(result, Err(ProcessAccessFailure::NotInSystem32)),
+            "inspect_candidate_process must reject the current test process with NotInSystem32, got: {result:?}"
         );
+    }
 
-        assert!(
-            !is_in_system32(&path, &system32_native_path),
-            "The test binary ({path:?}) should not be located in System32"
-        );
+    /// Verifies that constructing a Token from an invalid process handle correctly yields an `OpenProcessToken` Win32 error.
+    #[test]
+    fn token_from_process_handle_with_invalid_handle_returns_win32_error() {
+        let result = Token::from_process_handle(HANDLE::default());
+        match result {
+            Err(ElevateError::Win32 { operation, .. }) => {
+                assert_eq!(operation, "OpenProcessToken");
+            }
+            other => panic!("Expected Win32 OpenProcessToken error, got: {other:?}"),
+        }
     }
 
     #[test]

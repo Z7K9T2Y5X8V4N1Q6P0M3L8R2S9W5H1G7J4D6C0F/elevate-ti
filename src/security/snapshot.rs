@@ -12,6 +12,7 @@ use super::win32;
 use crate::error::ElevateError;
 
 /// Lightweight, zero-allocation borrowed view of a process entry in a snapshot.
+#[derive(Debug)]
 pub struct ProcessEntry<'a> {
     /// Process ID (PID).
     pub pid: u32,
@@ -47,6 +48,7 @@ impl ProcessEntry<'_> {
 }
 
 /// Lightweight RAII cursor over active system processes.
+#[derive(Debug)]
 pub struct ProcessSnapshot {
     handle: HANDLE,
     entry: PROCESSENTRY32W,

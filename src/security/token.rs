@@ -42,6 +42,7 @@ pub enum TokenType {
 }
 
 /// Strongly-typed RAII guard holding an open process or thread token handle.
+#[derive(Debug)]
 pub struct Token {
     handle: HANDLE,
     report: Option<ElevationReport>,
@@ -75,6 +76,17 @@ impl Token {
         let mut token = HANDLE::default();
         win32!(OpenProcessToken(
             process.0,
+            TOKEN_ACCESS_MASK(MAXIMUM_ALLOWED),
+            &raw mut token
+        ))?;
+        Ok(Self::from_raw(token))
+    }
+
+    /// Open the security token belonging to an already opened process handle.
+    pub(crate) fn from_process_handle(process: HANDLE) -> Result<Self, ElevateError> {
+        let mut token = HANDLE::default();
+        win32!(OpenProcessToken(
+            process,
             TOKEN_ACCESS_MASK(MAXIMUM_ALLOWED),
             &raw mut token
         ))?;
