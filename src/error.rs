@@ -133,10 +133,6 @@ pub enum ElevateError {
         privilege: &'static str,
     },
 
-    /// Failed to resolve the canonical Windows System32 directory path.
-    #[error("Failed to resolve canonical System32 directory")]
-    SystemDirectoryNotFound,
-
     /// A Windows service failed to start or entered a failed state.
     #[error(
         "Service '{name}' failed unexpectedly (win32 exit code: {exit_code}{})",
@@ -203,13 +199,6 @@ pub enum ElevateError {
         needed: usize,
         /// Maximum capacity of the allocated buffer.
         capacity: usize,
-    },
-
-    /// Failed to query or retrieve the process image executable path.
-    #[error("Failed to query executable image path for PID {pid}")]
-    ProcessImagePathUnavailable {
-        /// The target process ID.
-        pid: u32,
     },
 
     /// Binding token to the target Windows Session ID failed post-verification readback.

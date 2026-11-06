@@ -13,6 +13,10 @@ use windows::{
     Win32::{
         Foundation::MAX_PATH,
         Security::WinLocalSystemSid,
+        Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, GetFinalPathNameByHandleW, OPEN_EXISTING, VOLUME_NAME_NT,
+        },
         System::{
             RemoteDesktop::{
                 WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW, WTSActive, WTSEnumerateSessionsW,
@@ -21,12 +25,12 @@ use windows::{
             SystemInformation::GetSystemDirectoryW,
             SystemServices::SECURITY_MANDATORY_SYSTEM_RID,
             Threading::{
-                OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+                OpenProcess, PROCESS_NAME_NATIVE, PROCESS_QUERY_LIMITED_INFORMATION,
                 QueryFullProcessImageNameW,
             },
         },
     },
-    core::PWSTR,
+    core::{HSTRING, PCWSTR, PWSTR},
 };
 
 use crate::{
@@ -212,10 +216,11 @@ impl Elevator {
     /// Resolve an accessible Session 0 SYSTEM process (PID and image name) to serve as the elevation pivot.
     ///
     /// Prioritizes the configured preferred process (e.g. `services.exe`) via zero-copy name comparisons
-    /// after verifying it resides in the canonical System32 directory and holds genuine Session 0 SYSTEM
-    /// privileges. If that fails, falls back to scanning other running processes.
+    /// after verifying its binary physically resides in the canonical System32 directory via kernel-level
+    /// NT device path normalization and holds genuine Session 0 SYSTEM privileges. If that fails, falls back
+    /// to scanning other running processes.
     fn resolve_system_process(&self) -> Result<(u32, String), ElevateError> {
-        let system32_path = get_system32_path()?;
+        let system32_native_path = get_canonical_system32_native_path()?;
         let mut diagnostics = Vec::new();
         let mut checked_pids = HashSet::new();
 
@@ -229,7 +234,7 @@ impl Elevator {
             let pid = proc.pid;
             checked_pids.insert(pid);
 
-            let image_path = match get_process_image_path(pid) {
+            let image_native_path = match get_process_image_native_path(pid) {
                 Ok(path) => path,
                 Err(e) => {
                     diagnostics.push(ProcessDiagnostic {
@@ -241,7 +246,7 @@ impl Elevator {
                 }
             };
 
-            if !is_in_system32(&image_path, &system32_path) {
+            if !is_in_system32(&image_native_path, &system32_native_path) {
                 diagnostics.push(ProcessDiagnostic {
                     pid,
                     name: proc.to_string_lossy(),
@@ -283,7 +288,7 @@ impl Elevator {
                 continue;
             }
 
-            let exe_path = match get_process_image_path(pid) {
+            let image_native_path = match get_process_image_native_path(pid) {
                 Ok(path) => path,
                 Err(e) => {
                     diagnostics.push(ProcessDiagnostic {
@@ -294,7 +299,7 @@ impl Elevator {
                     continue;
                 }
             };
-            if !is_in_system32(&exe_path, &system32_path) {
+            if !is_in_system32(&image_native_path, &system32_native_path) {
                 continue;
             }
 
@@ -427,14 +432,16 @@ fn has_logged_on_user(session_id: u32) -> Result<bool, ElevateError> {
 }
 
 /// Retrieve the canonical path to the Windows System32 directory (e.g. `C:\Windows\System32`).
-fn get_system32_path() -> Result<PathBuf, ElevateError> {
+pub(crate) fn get_system32_path() -> Result<PathBuf, ElevateError> {
     let mut buf = [0u16; MAX_PATH as usize];
 
     let char_count = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
     if char_count == 0 {
-        return Err(ElevateError::SystemDirectoryNotFound);
+        return Err(ElevateError::Win32 {
+            operation: "GetSystemDirectoryW",
+            source: windows::core::Error::from_thread(),
+        });
     }
-
     if char_count >= buf.len() {
         return Err(ElevateError::PathBufferTooSmall {
             needed: char_count,
@@ -445,8 +452,48 @@ fn get_system32_path() -> Result<PathBuf, ElevateError> {
     Ok(wide_to_path(&buf[..char_count]))
 }
 
-/// Query the full executable image file path for a running process by its PID.
-fn get_process_image_path(pid: u32) -> Result<PathBuf, ElevateError> {
+/// Query the resolved NT device path of the canonical System32 directory (e.g. `\Device\HarddiskVolume3\Windows\System32`).
+///
+/// Resolves symlinks, directory junctions, and virtual volume remappings via kernel-level handle querying.
+pub(crate) fn get_canonical_system32_native_path() -> Result<PathBuf, ElevateError> {
+    let sys32_dos = get_system32_path()?;
+    let path_hstring = HSTRING::from(sys32_dos.as_os_str());
+
+    // FILE_FLAG_BACKUP_SEMANTICS is required to obtain a handle to a directory object.
+    let dir_handle = HandleGuard(win32!(CreateFileW(
+        PCWSTR(path_hstring.as_ptr()),
+        FILE_GENERIC_READ.0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        None,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        None,
+    ))?);
+
+    let mut buf = [0u16; 1024];
+    let char_count =
+        unsafe { GetFinalPathNameByHandleW(dir_handle.0, &mut buf, VOLUME_NAME_NT) } as usize;
+    if char_count == 0 {
+        return Err(ElevateError::Win32 {
+            operation: "GetFinalPathNameByHandleW",
+            source: windows::core::Error::from_thread(),
+        });
+    }
+    if char_count >= buf.len() {
+        return Err(ElevateError::PathBufferTooSmall {
+            needed: char_count,
+            capacity: buf.len(),
+        });
+    }
+
+    Ok(wide_to_path(&buf[..char_count]))
+}
+
+/// Query the native NT device path of a running process image (e.g. `\Device\HarddiskVolume3\Windows\System32\services.exe`).
+///
+/// Uses `PROCESS_NAME_NATIVE` to completely bypass DOS drive letter substitutions (`subst`),
+/// junction points, and user-space symlink redirection.
+pub(crate) fn get_process_image_native_path(pid: u32) -> Result<PathBuf, ElevateError> {
     let process = HandleGuard(win32!(OpenProcess(
         PROCESS_QUERY_LIMITED_INFORMATION,
         false,
@@ -458,13 +505,10 @@ fn get_process_image_path(pid: u32) -> Result<PathBuf, ElevateError> {
 
     win32!(QueryFullProcessImageNameW(
         process.0,
-        PROCESS_NAME_FORMAT(0),
+        PROCESS_NAME_NATIVE,
         PWSTR(buf.as_mut_ptr()),
         &raw mut char_count,
     ))?;
-    if char_count == 0 {
-        return Err(ElevateError::ProcessImagePathUnavailable { pid });
-    }
 
     Ok(wide_to_path(&buf[..char_count as usize]))
 }
@@ -475,12 +519,13 @@ fn wide_to_path(wide: &[u16]) -> PathBuf {
     PathBuf::from(OsString::from_wide(wide))
 }
 
-/// Verify that the given executable path is located directly inside the System32 directory.
-fn is_in_system32(exe_path: &Path, system32_path: &Path) -> bool {
-    exe_path
+/// Verify that the given executable path is located directly inside the System32 directory
+/// by comparing their normalized NT kernel device paths.
+pub(crate) fn is_in_system32(exe_native_path: &Path, system32_native_path: &Path) -> bool {
+    exe_native_path
         .parent()
         .and_then(|p| p.to_str())
-        .zip(system32_path.to_str())
+        .zip(system32_native_path.to_str())
         .is_some_and(|(parent, system32)| parent.eq_ignore_ascii_case(system32))
 }
 
@@ -572,23 +617,38 @@ mod tests {
     #[test]
     fn get_system32_path_locates_valid_system_directory() {
         let path = get_system32_path().expect("System32 directory path must be resolvable");
-        let path_str = path.to_string_lossy().to_lowercase();
+        let path = path.to_string_lossy().to_lowercase();
         assert!(
-            path_str.contains("system32"),
-            "System directory must contain 'system32', got: {path_str}"
+            path.contains("system32"),
+            "System directory must contain 'system32', got: {path}"
         );
     }
 
     #[test]
-    fn get_process_image_path_with_invalid_pids_returns_win32_error() {
-        match get_process_image_path(0) {
+    fn get_canonical_system32_native_path_resolves_to_device_volume() {
+        let path = get_canonical_system32_native_path()
+            .expect("System32 canonical NT path must be resolvable");
+        let path = path.to_string_lossy();
+        assert!(
+            path.starts_with(r"\Device\"),
+            "Canonical NT path must start with '\\Device\\', got: {path}"
+        );
+        assert!(
+            path.to_lowercase().ends_with(r"\system32"),
+            "Canonical NT path must end with '\\system32', got: {path}"
+        );
+    }
+
+    #[test]
+    fn get_process_image_native_path_with_invalid_pids_returns_win32_error() {
+        match get_process_image_native_path(0) {
             Err(ElevateError::Win32 { operation, .. }) => {
                 assert_eq!(operation, "OpenProcess");
             }
             other => panic!("Expected Win32 OpenProcess error for PID 0, got: {other:?}"),
         }
 
-        match get_process_image_path(u32::MAX - 1) {
+        match get_process_image_native_path(u32::MAX - 1) {
             Err(ElevateError::Win32 { operation, .. }) => {
                 assert_eq!(operation, "OpenProcess");
             }
@@ -597,42 +657,47 @@ mod tests {
     }
 
     #[test]
-    fn get_process_image_path_returns_valid_path_for_current_process() {
-        let system32_path = get_system32_path().unwrap();
+    fn get_process_image_native_path_returns_valid_nt_path_for_current_process() {
+        let system32_native_path = get_canonical_system32_native_path().unwrap();
         let current_pid = std::process::id();
 
-        let path = get_process_image_path(current_pid)
-            .expect("Should be able to query current process image path");
+        let path = get_process_image_native_path(current_pid)
+            .expect("Should be able to query current process native image path");
 
         assert!(
-            !is_in_system32(&path, &system32_path),
+            path.to_string_lossy().starts_with(r"\Device\"),
+            "Native path must start with '\\Device\\', got: {path:?}"
+        );
+
+        assert!(
+            !is_in_system32(&path, &system32_native_path),
             "The test binary ({path:?}) should not be located in System32"
         );
     }
 
     #[test]
-    fn is_in_system32_matches_only_direct_children() {
-        let system32_path = Path::new(r"C:\Windows\System32");
+    fn is_in_system32_matches_only_direct_children_with_nt_paths() {
+        let system32_nt = Path::new(r"\Device\HarddiskVolume3\Windows\System32");
 
         assert!(is_in_system32(
-            Path::new(r"C:\Windows\System32\services.exe"),
-            system32_path
+            Path::new(r"\Device\HarddiskVolume3\Windows\System32\services.exe"),
+            system32_nt
         ));
         assert!(is_in_system32(
-            Path::new(r"c:\windows\system32\svchost.exe"),
-            system32_path
+            Path::new(r"\device\harddiskvolume3\windows\system32\svchost.exe"),
+            system32_nt
         ));
         assert!(!is_in_system32(
-            Path::new(r"C:\Windows\System32\drivers\etc"),
-            system32_path
+            Path::new(r"\Device\HarddiskVolume3\Windows\System32\drivers\etc"),
+            system32_nt
         ));
         assert!(!is_in_system32(
-            Path::new(r"C:\Windows\explorer.exe"),
-            system32_path
+            Path::new(r"\Device\HarddiskVolume3\Windows\explorer.exe"),
+            system32_nt
         ));
         assert!(!is_in_system32(
-            Path::new(r"D:\Tools\fake_services.exe"),
-            system32_path
+            Path::new(r"\Device\HarddiskVolume4\Windows\System32\fake_services.exe"),
+            system32_nt
         ));
     }
 

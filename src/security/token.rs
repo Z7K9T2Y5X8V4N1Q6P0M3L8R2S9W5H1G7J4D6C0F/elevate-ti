@@ -355,11 +355,10 @@ impl Token {
         unsafe {
             SetLastError(WIN32_ERROR(0));
             let _ = GetTokenInformation(self.handle, class, None, 0, &raw mut bytes_needed);
-            let last_error = GetLastError();
-            if last_error != ERROR_INSUFFICIENT_BUFFER {
+            if GetLastError() != ERROR_INSUFFICIENT_BUFFER {
                 return Err(ElevateError::Win32 {
                     operation: "GetTokenInformation (probe size)",
-                    source: windows::core::Error::from_hresult(last_error.to_hresult()),
+                    source: windows::core::Error::from_thread(),
                 });
             }
         }
