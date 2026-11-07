@@ -77,6 +77,23 @@ impl Default for ExecutionContext {
 }
 
 /// A process builder for executing commands with `TrustedInstaller` privileges.
+///
+/// # Security Considerations
+///
+/// Running processes with `NT SERVICE\TrustedInstaller` privileges bypasses virtually all
+/// Windows access control lists (ACLs) and security boundaries.
+///
+/// ## Path Resolution and Binary Planting
+///
+/// When passing a path to [`Command`], the target is passed to the underlying Windows
+/// `CreateProcessWithTokenW` API:
+///
+/// - **Bare filenames (e.g. `"cmd.exe"`) and relative paths**: Windows may search the current
+///   working directory (CWD) before locating the binary in system directories. If the current
+///   working directory is untrusted or writable by low-privileged users (e.g., `C:\Temp`),
+///   an attacker could place a malicious binary there to achieve arbitrary code execution as `TrustedInstaller`.
+/// - **Best Practice**: Always prefer absolute paths or standard environment variables,
+///   such as `"%SystemRoot%\\System32\\cmd.exe"` (which are automatically expanded by this library).
 #[must_use = "commands do nothing unless spawned"]
 #[derive(Debug)]
 pub struct Command {
@@ -88,11 +105,17 @@ pub struct Command {
 
 impl Command {
     /// Create a new elevated command targeting the default interactive desktop (`WinSta0\Default`).
+    ///
+    /// See the [Security Considerations](Command#security-considerations) section on [`Command`]
+    /// for important recommendations regarding relative paths and binary planting.
     pub fn new(program: impl AsRef<Path>) -> Result<Self, ElevateError> {
         Self::on_desktop(&InteractiveDesktop::Default, program)
     }
 
     /// Create an elevated command strictly for Session 0 headless background execution.
+    ///
+    /// See the [Security Considerations](Command#security-considerations) section on [`Command`]
+    /// for important recommendations regarding relative paths and binary planting.
     pub fn headless(program: impl AsRef<Path>) -> Result<Self, ElevateError> {
         let elevator = Elevator::new(ExecutionContext::Headless);
         let token = elevator.acquire_primary_token()?;
@@ -107,6 +130,9 @@ impl Command {
     }
 
     /// Create an elevated command targeting a specific interactive desktop.
+    ///
+    /// See the [Security Considerations](Command#security-considerations) section on [`Command`]
+    /// for important recommendations regarding relative paths and binary planting.
     pub fn on_desktop(
         desktop: &InteractiveDesktop,
         program: impl AsRef<Path>,

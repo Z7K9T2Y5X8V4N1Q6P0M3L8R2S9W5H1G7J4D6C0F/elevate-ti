@@ -1,6 +1,6 @@
 //! Domain error types for `TrustedInstaller` elevation operations.
 
-use std::{fmt::Display, io};
+use std::{fmt::Display, io, path::PathBuf};
 use thiserror::Error;
 use windows::Win32::Foundation::E_ACCESSDENIED;
 
@@ -14,7 +14,7 @@ pub enum ProcessAccessFailure {
     #[error("Binary path is outside canonical System32")]
     NotInSystem32,
 
-    /// The token was accessible, but lacks SYSTEM SID, requisite privileges, or integrity level.
+    /// The token was accessible, but lacks SYSTEM rights or privileges.
     #[error("Token accessible, but lacks SYSTEM rights or privileges")]
     InsufficientPrivileges,
 
@@ -174,6 +174,10 @@ pub enum ElevateError {
     #[error("Target executable path must be specified")]
     MissingExePath,
 
+    /// The target executable could not be resolved or found in trusted search paths.
+    #[error("Target executable '{0}' could not be resolved to a valid file on disk")]
+    ProgramNotFound(PathBuf),
+
     /// A query to token information returned corrupted or out-of-bounds data.
     #[error("Token information buffer is invalid or empty")]
     InvalidTokenBuffer,
@@ -225,10 +229,10 @@ pub enum ElevateError {
 
     /// No interactive session with a logged-on user was found.
     #[error(
-            "No interactive desktop session available on this machine. Inspected {} session(s):{}",
-            diagnostics.len(),
-            format_diagnostics(diagnostics)
-        )]
+        "No interactive desktop session available on this machine. Inspected {} session(s):{}",
+        diagnostics.len(),
+        format_diagnostics(diagnostics)
+    )]
     NoInteractiveSession {
         /// Full diagnostic log detailing why candidate sessions were rejected.
         diagnostics: Vec<SessionDiagnostic>,

@@ -6,30 +6,25 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE-MIT)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?style=flat-square&logo=windows)](https://microsoft.com)
 
-**A safe, idiomatic Rust library to obtain Windows TrustedInstaller privileges.**
+**Spawn processes with `NT SERVICE\TrustedInstaller` privileges from Rust.**
 
-## Overview
+Navigates Session 0 isolation via token impersonation, allowing execution either interactively on the active desktop (`WinSta0\Default`) or headlessly in background sessions (CI, services).
 
-`elevate-ti` is an ergonomic Windows systems library designed to elevate privileges to `NT SERVICE\TrustedInstaller`. It acquires primary tokens via chained impersonation, navigates Session 0 isolation, and supports launching processes either onto an active interactive desktop (`WinSta0\Default`) or within headless background sessions (CI, services, and tasks).
-
-## Architecture Flow
+## How It Works
 
 ```text
-Caller (Admin with SeDebugPrivilege)
+Caller (Admin + SeDebugPrivilege)
   │
-  ├─> 1. Ensure "TrustedInstaller" Service is Running (SCM polling)
+  ├── 1. Ensure TrustedInstaller service is running (SCM)
   │
-  ├─> 2. Pivot to Session 0 SYSTEM Token (Bypassing RunAs-PPL/WinTCB)
-  │     ├─> Primary: services.exe (System32 path validated)
-  │     └─> Fallback: Dynamic Session 0 scan & token verification
+  ├── 2. Steal Session 0 SYSTEM Token (services.exe or scan fallback)
+  │      └─> Impersonate to acquire SeTcbPrivilege
   │
-  ├─> 3. Impersonate SYSTEM (Acquires SeTcbPrivilege)
-  │     │
-  │     └─> Duplicate TrustedInstaller Token (TokenPrimary)
-  │           ├─> Headless: Bind strictly to Session 0 (No desktop station)
-  │           └─> Interactive: Reassign TokenSessionId + Readback Verification
+  ├── 3. Duplicate TrustedInstaller Token
+  │      ├── Interactive ──> Assign to active TokenSessionId
+  │      └── Headless    ──> Keep in Session 0
   │
-  └─> 4. CreateProcessWithTokenW (Target Desktop or Headless Context)
+  └── 4. Spawn Process (CreateProcessWithTokenW)
 ```
 
 ## Installation
@@ -45,10 +40,14 @@ cargo add elevate-ti
 ```rust
 use elevate_ti::Command;
 
-// Spawn an interactive TrustedInstaller process on the active desktop
-Command::new("%SystemRoot%\\System32\\cmd.exe")?
-    .args("/k whoami /groups")
-    .spawn()?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Spawn an interactive TrustedInstaller process on the active desktop
+    Command::new("cmd.exe")
+        .args("/k whoami /groups")
+        .spawn()?;
+
+    Ok(())
+}
 ```
 
 ## Examples

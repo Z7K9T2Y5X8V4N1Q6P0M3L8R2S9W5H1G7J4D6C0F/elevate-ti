@@ -1,6 +1,6 @@
 [package]
 name = "elevate-ti"
-version = "0.20.1"
+version = "0.20.2"
 edition = "2024"
 description = "A safe, idiomatic Rust library to obtain Windows TrustedInstaller privileges"
 readme = "README.md"
