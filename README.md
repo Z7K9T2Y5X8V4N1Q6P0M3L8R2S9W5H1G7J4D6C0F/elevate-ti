@@ -59,6 +59,14 @@ For complete and runnable scenarios, check the [`examples`](examples) directory:
 - [`headless.rs`](examples/headless.rs): Non-interactive background execution in Session 0.
 - [`audit.rs`](examples/audit.rs): In-process token acquisition and kernel audit provenance reporting.
 
+## Disclaimer / Legal Notice
+
+This project is intended strictly for educational, security research, and authorized administrative or system maintenance purposes (such as operating system repair, advanced configuration management, or CI/CD testing environments).
+
+- **Authorized Use Only**: Do not use this tool on computer systems or environments without explicit prior authorization from the system owner.
+- **Limitation of Liability**: The authors and contributors explicitly disclaim all liability for any damages, security incidents, or legal consequences resulting from the misuse, abuse, or unauthorized deployment of this software.
+- **Security Software Notification**: Because this library manipulates Windows security tokens (analogous to legitimate administrative sysadmin utilities like Sysinternals `PsExec`), some Antivirus (AV) or Endpoint Detection and Response (EDR) solutions may heuristically flag programs built with this library. This is a false-positive indicator based on administrative capability, not an inherent vulnerability or malware exploit.
+
 ## License
 
 Licensed under either of:
